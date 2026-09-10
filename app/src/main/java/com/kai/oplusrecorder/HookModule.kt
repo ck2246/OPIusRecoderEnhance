@@ -1,6 +1,6 @@
 package com.kai.oplusrecorder
 
-import android.graphics.Point
+import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
@@ -93,31 +93,170 @@ class HookModule : XposedModule() {
             val prefs = getRemotePreferences("settings")
             videoBitrate = prefs.getInt("video_bitrate", 30_000_000)
             audioBitrate = prefs.getInt("audio_bitrate", 320_000)
-            log("Settings: videoBitrate=$videoBitrate, audioBitrate=$audioBitrate")
+            log("Settings: videoBitrate=$videoBitrate, audioBitrate=$audioBitrate")//这里logcat有输出
         } catch (t: Throwable) {
             log("Failed to read settings, using defaults", t)
         }
 
-        // VirtualDisplay 分辨率 hook（在所有进程中安装）
-        hookVirtualDisplayConfigBuilder()  // 新 API：Builder 模式（主要路径）
-        hookVirtualDisplay()               // 旧 API：8 参数直接传宽高（兼容）
-        hookDisplayManagerCreateVirtualDisplay()  // DisplayManager 路径（兼容）
-        hookDisplayManagerGlobal()         // DisplayManagerGlobal 最终汇聚点
-        hookMediaProjectionAll()           // MediaProjection 所有方法诊断
-
-        // Display 分辨率查询 hook（从源头修改应用看到的分辨率）
-        hookDisplayGetMetrics()
-
         if (isMainProcess) {
-            // 主进程：构建 MediaFormat 的地方，setInteger/createVD 在这里调用
             log("========== HOOKING MAIN PROCESS ==========")
+
+            // ---- 诊断：枚举所有可用的 Hook 目标 ----
+            diagnoseAvailableHooks(param.classLoader)
+
+            // ---- 框架类 Hook（可能不触发，用于验证） ----
+            hookMediaProjectionCreateVirtualDisplay()
             hookMediaFormatSetInteger()
-            hookMediaFormatSetFloat()
-            hookMediaFormatSetString()
+            hookMediaFormatCreateVideoFormat()
             hookMediaCodecConfigureLog()
+            hookDisplayGetMetrics()
+            hookDisplayManagerCreateVirtualDisplay()
+
+            hookVirtualDisplayResize()
+
+            // 应用层包装类 i4.u（App 代码，始终可被 Xposed 拦截）—— 主修复入口
+            hookI4UClass(param.classLoader)
         } else {
             // 子进程：只记录信息
             log("Child process: $processSuffix - functional hooks limited to main process")
+        }
+    }
+
+    // =============================================
+    // 诊断：枚举应用内部类，寻找分辨率相关的 Hook 点
+    // =============================================
+    private fun diagnoseAvailableHooks(classLoader: ClassLoader) {
+        // 1. 检查 e4.h 是否仍然存在（旧版 OPlus 混淆类）
+        try {
+            val cls = Class.forName("e4.h", false, classLoader)
+            log("[DIAG] e4.h EXISTS, methods:")
+            for (m in cls.declaredMethods) {
+                log("  ${m.name}(${m.parameterTypes.joinToString(",") { it.simpleName }})")
+            }
+        } catch (_: Throwable) {
+            log("[DIAG] e4.h NOT FOUND (class mapping may have changed)")
+        }
+
+        // 2. 扫描常见混淆包名，寻找含 int,int 参数的方法（可能是分辨率传入点）
+        val suspectPackages = setOf("e4", "i4", "d4", "f4", "g4", "h4")
+        for (pkg in suspectPackages) {
+            try {
+                // 尝试枚举 dex 中的类（通过已知类推断）
+                val knownClasses = listOf(
+                    "$pkg.h", "$pkg.o", "$pkg.u", "$pkg.a", "$pkg.b",
+                    "$pkg.c", "$pkg.d", "$pkg.e", "$pkg.f", "$pkg.g"
+                )
+                for (cn in knownClasses) {
+                    try {
+                        val cls = Class.forName(cn, false, classLoader)
+                        for (m in cls.declaredMethods) {
+                            val params = m.parameterTypes
+                            // 找含有两个连续 int 参数的方法（可能是 width, height）
+                            for (i in 0 until params.size - 1) {
+                                if (params[i] == Int::class.javaPrimitiveType &&
+                                    params[i + 1] == Int::class.javaPrimitiveType
+                                ) {
+                                    log("[DIAG] $cn.${m.name} has (int,int) at [$i,${i + 1}]: ${params.joinToString(",") { it.simpleName }}")
+                                }
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+        }
+
+        // 3. 检查 MediaProjection 的所有 createVirtualDisplay 重载
+        try {
+            val mpClass = MediaProjection::class.java
+            log("[DIAG] MediaProjection.createVirtualDisplay overloads:")
+            for (m in mpClass.getDeclaredMethods()) {
+                if (m.name == "createVirtualDisplay") {
+                    log("  (${m.parameterTypes.joinToString(",") { it.simpleName }})")
+                }
+            }
+        } catch (t: Throwable) {
+            log("[DIAG] MediaProjection scan failed: ${t.message}")
+        }
+
+        // 4. 检查 DisplayManager 的 createVirtualDisplay
+        try {
+            val dmClass = DisplayManager::class.java
+            log("[DIAG] DisplayManager.createVirtualDisplay overloads:")
+            for (m in dmClass.getDeclaredMethods()) {
+                if (m.name == "createVirtualDisplay") {
+                    log("  (${m.parameterTypes.joinToString(",") { it.simpleName }})")
+                }
+            }
+        } catch (t: Throwable) {
+            log("[DIAG] DisplayManager scan failed: ${t.message}")
+        }
+
+        // 在 diagnoseAvailableHooks 中添加
+        try {
+            val uCls = classLoader.loadClass("i4.u")
+            log("[DIAG] i4.u EXISTS, methods:")
+            for (m in uCls.declaredMethods) {
+                val params = m.parameterTypes.joinToString { it.simpleName }
+                log("  ${m.name}($params)")
+            }
+        } catch (_: Throwable) {
+            log("[DIAG] i4.u NOT FOUND")
+        }
+    }
+
+    // =============================================
+    // Hook MediaProjection.createVirtualDisplay (8-arg)
+    // =============================================
+    private fun hookMediaProjectionCreateVirtualDisplay() {
+        try {
+            val mpClass = MediaProjection::class.java
+            val surfaceClass = Class.forName("android.view.Surface")
+            val vdCallbackClass = Class.forName("android.hardware.display.VirtualDisplay\$Callback")
+            val handlerClass = Class.forName("android.os.Handler")
+
+            val createVD8 = mpClass.getDeclaredMethod(
+                "createVirtualDisplay",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                surfaceClass,
+                vdCallbackClass,
+                handlerClass
+            )
+
+            deoptimize(createVD8)
+
+            hook(createVD8).intercept { chain ->
+                try {
+                    val args = chain.args
+                    val w = args[1] as Int
+                    val h = args[2] as Int
+
+                    log("[VirtualDisplay BEFORE] ${w}x${h}")
+
+                    if (w == ORIG_W && h == ORIG_H) {
+                        args[1] = TARGET_W
+                        args[2] = TARGET_H
+                        log("[HOOK VD] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
+                    } else if (w == ORIG_H && h == ORIG_W) {
+                        args[1] = TARGET_H
+                        args[2] = TARGET_W
+                        log("[HOOK VD] ${w}x${h} -> ${TARGET_H}x${TARGET_W}")
+                    }
+
+                    log("[VirtualDisplay AFTER] ${args[1]}x${args[2]}")
+                    chain.proceed(args.toTypedArray())
+                } catch (t: Throwable) {
+                    log("[VD CALLBACK ERROR]", t)
+                    chain.proceed()
+                }
+            }
+
+            log("[+] MediaProjection.createVirtualDisplay hook installed")
+        } catch (t: Throwable) {
+            log("HOOK createVirtualDisplay FAILED", t)
         }
     }
 
@@ -163,83 +302,64 @@ class HookModule : XposedModule() {
         }
     }
 
-    // =============================================
-    // Hook MediaFormat.setFloat(String, float)
-    // 排查：应用是否用 setFloat 设置分辨率
-    // =============================================
-    private fun hookMediaFormatSetFloat() {
-        try {
-            val setFloat = MediaFormat::class.java.getDeclaredMethod(
-                "setFloat", String::class.java, Float::class.javaPrimitiveType
-            )
-
-            deoptimize(setFloat)
-
-            hook(setFloat).intercept { chain ->
-                try {
-                    val key = chain.args[0] as String
-                    val value = chain.args[1] as Float
-                    log("[setFloat] key=$key, value=$value")
-                    chain.proceed(arrayOf(chain.args[0], value))
-                } catch (t: Throwable) {
-                    log("[setFloat CALLBACK ERROR]", t)
-                    chain.proceed()
-                }
-            }
-
-            log("[+] MediaFormat.setFloat hook installed")
-
-        } catch (t: Throwable) {
-            log("HOOK setFloat FAILED", t)
-        }
-    }
-
-    // =============================================
-    // Hook MediaFormat.setString(String, String)
-    // 排查：应用是否用 setString 设置 mime 等关键参数
-    // =============================================
-    private fun hookMediaFormatSetString() {
-        try {
-            val setString = MediaFormat::class.java.getDeclaredMethod(
-                "setString", String::class.java, String::class.java
-            )
-
-            deoptimize(setString)
-
-            hook(setString).intercept { chain ->
-                try {
-                    val key = chain.args[0] as String
-                    val value = chain.args[1] as String
-                    log("[setString] key=$key, value=$value")
-                    chain.proceed(arrayOf(chain.args[0], value))
-                } catch (t: Throwable) {
-                    log("[setString CALLBACK ERROR]", t)
-                    chain.proceed()
-                }
-            }
-
-            log("[+] MediaFormat.setString hook installed")
-
-        } catch (t: Throwable) {
-            log("HOOK setString FAILED", t)
-        }
-    }
-
     /**
      * 计算修改后的值，返回 null 表示不需要修改
+     * 与 hook.js (Frida) 保持一致的修改策略
      */
     private fun computeNewValue(key: String, value: Int): Int? {
+        // 修改宽度
         if (key == "width" && value == ORIG_W) return TARGET_W
+        if (key == "width" && value == ORIG_H) return TARGET_H
+        // 修改高度
         if (key == "height" && value == ORIG_H) return TARGET_H
+        if (key == "height" && value == ORIG_W) return TARGET_W
+        // 修改视频码率（> 1Mbps 视为视频）
         if (key == "bitrate" && value > 1_000_000) return videoBitrate
+        // 修改音频码率（< 1Mbps 视为音频）
         if (key == "bitrate" && value < 1_000_000) return audioBitrate
         return null
     }
 
     // =============================================
+    // Hook MediaFormat.createVideoFormat(String, int, int)
+    // 诊断：检查应用是否通过此工厂方法创建格式
+    // =============================================
+    private fun hookMediaFormatCreateVideoFormat() {
+        try {
+            val createVideoFormat = MediaFormat::class.java.getDeclaredMethod(
+                "createVideoFormat", String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            )
+
+            deoptimize(createVideoFormat)
+
+            hook(createVideoFormat).intercept { chain ->
+                try {
+                    val mime = chain.args[0] as String
+                    val w = chain.args[1] as Int
+                    val h = chain.args[2] as Int
+                    log("[createVideoFormat] BEFORE: mime=$mime, ${w}x${h}")
+
+                    val result = chain.proceed()
+
+                    log("[createVideoFormat] AFTER: result=$result")
+                    result
+                } catch (t: Throwable) {
+                    log("[createVideoFormat CALLBACK ERROR]", t)
+                    chain.proceed()
+                }
+            }
+
+            log("[+] MediaFormat.createVideoFormat hook installed")
+        } catch (t: Throwable) {
+            log("HOOK createVideoFormat FAILED", t)
+        }
+    }
+
+    // =============================================
     // Hook Display.getMetrics / getRealMetrics
     // 从源头修改应用看到的屏幕分辨率
-    // 应用查询屏幕尺寸后用它创建 VirtualDisplayConfig.Builder
     // =============================================
     private fun hookDisplayGetMetrics() {
         try {
@@ -247,21 +367,23 @@ class HookModule : XposedModule() {
 
             // getMetrics(Point)
             try {
-                val getMetrics = displayClass.getDeclaredMethod("getMetrics", Point::class.java)
+                val getMetrics = displayClass.getDeclaredMethod(
+                    "getMetrics", android.graphics.Point::class.java
+                )
                 deoptimize(getMetrics)
                 hook(getMetrics).intercept { chain ->
                     try {
                         chain.proceed()
-                        val point = chain.args[0] as Point
+                        val point = chain.args[0] as android.graphics.Point
                         log("[Display.getMetrics] ${point.x}x${point.y}")
                         if (point.x == ORIG_W && point.y == ORIG_H) {
                             point.x = TARGET_W
                             point.y = TARGET_H
-                            log("[HOOK Display.getMetrics] ${ORIG_W}x${ORIG_H} -> ${TARGET_W}x${TARGET_H}")
+                            log("[HOOK Display.getMetrics] -> ${TARGET_W}x${TARGET_H}")
                         } else if (point.x == ORIG_H && point.y == ORIG_W) {
                             point.x = TARGET_H
                             point.y = TARGET_W
-                            log("[HOOK Display.getMetrics] ${ORIG_H}x${ORIG_W} -> ${TARGET_H}x${TARGET_W}")
+                            log("[HOOK Display.getMetrics] -> ${TARGET_H}x${TARGET_W}")
                         }
                     } catch (t: Throwable) {
                         log("[Display.getMetrics CALLBACK ERROR]", t)
@@ -275,21 +397,23 @@ class HookModule : XposedModule() {
 
             // getRealMetrics(Point)
             try {
-                val getRealMetrics = displayClass.getDeclaredMethod("getRealMetrics", Point::class.java)
+                val getRealMetrics = displayClass.getDeclaredMethod(
+                    "getRealMetrics", android.graphics.Point::class.java
+                )
                 deoptimize(getRealMetrics)
                 hook(getRealMetrics).intercept { chain ->
                     try {
                         chain.proceed()
-                        val point = chain.args[0] as Point
+                        val point = chain.args[0] as android.graphics.Point
                         log("[Display.getRealMetrics] ${point.x}x${point.y}")
                         if (point.x == ORIG_W && point.y == ORIG_H) {
                             point.x = TARGET_W
                             point.y = TARGET_H
-                            log("[HOOK Display.getRealMetrics] ${ORIG_W}x${ORIG_H} -> ${TARGET_W}x${TARGET_H}")
+                            log("[HOOK Display.getRealMetrics] -> ${TARGET_W}x${TARGET_H}")
                         } else if (point.x == ORIG_H && point.y == ORIG_W) {
                             point.x = TARGET_H
                             point.y = TARGET_W
-                            log("[HOOK Display.getRealMetrics] ${ORIG_H}x${ORIG_W} -> ${TARGET_H}x${TARGET_W}")
+                            log("[HOOK Display.getRealMetrics] -> ${TARGET_H}x${TARGET_W}")
                         }
                     } catch (t: Throwable) {
                         log("[Display.getRealMetrics CALLBACK ERROR]", t)
@@ -307,380 +431,152 @@ class HookModule : XposedModule() {
     }
 
     // =============================================
-    // 核心分辨率 hook：VirtualDisplayConfig.Builder
-    // 策略：Hook 所有构造函数 + build() 方法
-    // =============================================
-    private fun hookVirtualDisplayConfigBuilder() {
-        try {
-            val builderClass = Class.forName(
-                "android.hardware.display.VirtualDisplayConfig\$Builder"
-            )
-            val configClass = Class.forName(
-                "android.hardware.display.VirtualDisplayConfig"
-            )
-
-            // ===== 诊断：输出所有构造函数签名 =====
-            log("[VD Builder] Constructors:")
-            for (c in builderClass.declaredConstructors) {
-                log("  ctor: ${c.parameterTypes.joinToString(", ") { it.simpleName }}")
-            }
-            // ===== 诊断：输出 Builder 所有方法 =====
-            log("[VD Builder] Methods:")
-            for (m in builderClass.declaredMethods) {
-                log("  method: ${m.name}(${m.parameterTypes.joinToString(", ") { it.simpleName }}) -> ${m.returnType.simpleName}")
-            }
-            // ===== 诊断：输出 VirtualDisplayConfig 字段 =====
-            log("[VD Config] Fields:")
-            for (f in configClass.declaredFields) {
-                log("  field: ${f.type.simpleName} ${f.name} (final=${java.lang.reflect.Modifier.isFinal(f.modifiers)})")
-            }
-
-            // ===== 1. Hook ALL 构造函数 =====
-            for (c in builderClass.declaredConstructors) {
-                try {
-                    deoptimize(c)
-                    hook(c).intercept { chain ->
-                        try {
-                            val args = chain.args
-                            val paramTypes = c.parameterTypes
-                            log("[VD Builder ctor] called with ${args.size} args, types: ${paramTypes.joinToString(", ") { it.simpleName }}")
-                            for (i in args.indices) {
-                                log("  arg[$i] = ${args[i]} (${args[i]?.javaClass?.simpleName})")
-                            }
-
-                            // 找所有 int 参数，尝试匹配 width/height
-                            val intIndices = paramTypes.indices.filter { params ->
-                                paramTypes[params] == Int::class.javaPrimitiveType
-                            }
-                            if (intIndices.size >= 2) {
-                                val wIdx = intIndices[0]
-                                val hIdx = intIndices[1]
-                                val w = args[wIdx] as Int
-                                val h = args[hIdx] as Int
-                                log("[VD Builder ctor] w=$w, h=$h at idx [$wIdx,$hIdx]")
-
-                                if (w == ORIG_W && h == ORIG_H) {
-                                    args[wIdx] = TARGET_W
-                                    args[hIdx] = TARGET_H
-                                    log("[HOOK VD Builder ctor] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
-                                } else if (w == ORIG_H && h == ORIG_W) {
-                                    args[wIdx] = TARGET_H
-                                    args[hIdx] = TARGET_W
-                                    log("[HOOK VD Builder ctor] ${w}x${h} -> ${TARGET_H}x${TARGET_W}")
-                                }
-                            }
-
-                            chain.proceed(args.toTypedArray())
-                        } catch (t: Throwable) {
-                            log("[VD Builder ctor CALLBACK ERROR]", t)
-                            chain.proceed()
-                        }
-                    }
-                    log("[+] Hooked VD Builder ctor: ${c.parameterTypes.joinToString(", ") { it.simpleName }}")
-                } catch (t: Throwable) {
-                    log("[!] Failed to hook VD Builder ctor: ${t.message}")
-                }
-            }
-
-            // ===== 2. Hook build() 方法 - 修改返回的 config =====
-            try {
-                val buildMethod = builderClass.getDeclaredMethod("build")
-                deoptimize(buildMethod)
-                hook(buildMethod).intercept { chain ->
-                    try {
-                        val config = chain.proceed()
-                        log("[VD Builder build()] config=$config")
-
-                        // 尝试通过反射修改 config 的 width/height
-                        try {
-                            val wField = configClass.getDeclaredField("mWidth")
-                            val hField = configClass.getDeclaredField("mHeight")
-                            wField.isAccessible = true
-                            hField.isAccessible = true
-
-                            val oldW = wField.getInt(config)
-                            val oldH = hField.getInt(config)
-                            log("[VD Builder build()] config size: ${oldW}x${oldH}")
-
-                            if (oldW == ORIG_W && oldH == ORIG_H) {
-                                wField.setInt(config, TARGET_W)
-                                hField.setInt(config, TARGET_H)
-                                log("[HOOK VD Builder build()] ${oldW}x${oldH} -> ${TARGET_W}x${TARGET_H}")
-                            } else if (oldW == ORIG_H && oldH == ORIG_W) {
-                                wField.setInt(config, TARGET_H)
-                                hField.setInt(config, TARGET_W)
-                                log("[HOOK VD Builder build()] ${oldW}x${oldH} -> ${TARGET_H}x${TARGET_W}")
-                            }
-                        } catch (e: Throwable) {
-                            log("[VD Builder build()] reflection failed: ${e.message}")
-                            // 尝试其他字段名
-                            for (f in configClass.declaredFields) {
-                                if (f.type == Int::class.javaPrimitiveType) {
-                                    try {
-                                        f.isAccessible = true
-                                        log("  field '${f.name}' = ${f.getInt(config)}")
-                                    } catch (_: Throwable) {}
-                                }
-                            }
-                        }
-
-                        config  // 返回（可能已修改的）config
-                    } catch (t: Throwable) {
-                        log("[VD Builder build() CALLBACK ERROR]", t)
-                        chain.proceed()
-                    }
-                }
-                log("[+] VirtualDisplayConfig.Builder.build() hook installed")
-            } catch (t: Throwable) {
-                log("[!] build() hook failed: ${t.message}")
-            }
-
-        } catch (t: Throwable) {
-            log("hookVirtualDisplayConfigBuilder FAILED", t)
-        }
-    }
-
-    // =============================================
-    // Hook ALL MediaProjection.createVirtualDisplay overloads
-    // 诊断：找出应用实际调用的重载
-    // =============================================
-    private fun hookMediaProjectionAll() {
-        try {
-            val mpClass = MediaProjection::class.java
-            log("[MediaProjection] All createVirtualDisplay overloads:")
-            for (m in mpClass.getDeclaredMethods()) {
-                if (m.name == "createVirtualDisplay") {
-                    log("  ${m.parameterTypes.joinToString(", ") { it.simpleName }}")
-                }
-            }
-
-            // Hook 所有 createVirtualDisplay 重载
-            for (m in mpClass.getDeclaredMethods()) {
-                if (m.name != "createVirtualDisplay") continue
-                val params = m.parameterTypes
-                try {
-                    deoptimize(m)
-                    hook(m).intercept { chain ->
-                        try {
-                            val args = chain.args
-                            log("[MP createVD] called with ${args.size} args: ${args.joinToString(", ")}")
-
-                            // 找 int 参数中的 width/height
-                            val intIndices = params.indices.filter { params[it] == Int::class.javaPrimitiveType }
-                            if (intIndices.size >= 2) {
-                                val wIdx = intIndices[0]
-                                val hIdx = intIndices[1]
-                                val w = args[wIdx] as Int
-                                val h = args[hIdx] as Int
-                                log("[MP createVD] w=$w, h=$h at idx [$wIdx,$hIdx]")
-
-                                if (w == ORIG_W && h == ORIG_H) {
-                                    args[wIdx] = TARGET_W
-                                    args[hIdx] = TARGET_H
-                                    log("[HOOK MP createVD] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
-                                } else if (w == ORIG_H && h == ORIG_W) {
-                                    args[wIdx] = TARGET_H
-                                    args[hIdx] = TARGET_W
-                                    log("[HOOK MP createVD] ${w}x${h} -> ${TARGET_H}x${TARGET_W}")
-                                }
-                            }
-
-                            chain.proceed(args.toTypedArray())
-                        } catch (t: Throwable) {
-                            log("[MP createVD CALLBACK ERROR]", t)
-                            chain.proceed()
-                        }
-                    }
-                    log("[+] Hooked MP.createVirtualDisplay(${params.joinToString(", ") { it.simpleName }})")
-                } catch (t: Throwable) {
-                    log("[!] Failed to hook MP.createVD: ${t.message}")
-                }
-            }
-        } catch (t: Throwable) {
-            log("hookMediaProjectionAll FAILED", t)
-        }
-    }
-
-    // =============================================
-    // Hook DisplayManagerGlobal.createVirtualDisplay
-    // 所有 VD 创建最终汇聚到这里
-    // =============================================
-    private fun hookDisplayManagerGlobal() {
-        try {
-            val dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal")
-
-            log("[DMG] All createVirtualDisplay overloads:")
-            for (m in dmgClass.getDeclaredMethods()) {
-                if (m.name == "createVirtualDisplay") {
-                    log("  ${m.name}(${m.parameterTypes.joinToString(", ") { it.simpleName }})")
-                }
-            }
-
-            for (m in dmgClass.getDeclaredMethods()) {
-                if (m.name != "createVirtualDisplay") continue
-                val params = m.parameterTypes
-                try {
-                    deoptimize(m)
-                    hook(m).intercept { chain ->
-                        try {
-                            val args = chain.args
-                            log("[DMG createVD] called with ${args.size} args")
-                            for (i in args.indices) {
-                                log("  arg[$i] = ${args[i]} (${args[i]?.javaClass?.simpleName})")
-                            }
-
-                            // 找 int 参数中的 width/height
-                            val intIndices = params.indices.filter { params[it] == Int::class.javaPrimitiveType }
-                            if (intIndices.size >= 2) {
-                                val wIdx = intIndices[0]
-                                val hIdx = intIndices[1]
-                                val w = args[wIdx] as Int
-                                val h = args[hIdx] as Int
-                                log("[DMG createVD] w=$w, h=$h at idx [$wIdx,$hIdx]")
-
-                                if (w == ORIG_W && h == ORIG_H) {
-                                    args[wIdx] = TARGET_W
-                                    args[hIdx] = TARGET_H
-                                    log("[HOOK DMG createVD] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
-                                } else if (w == ORIG_H && h == ORIG_W) {
-                                    args[wIdx] = TARGET_H
-                                    args[hIdx] = TARGET_W
-                                    log("[HOOK DMG createVD] ${w}x${h} -> ${TARGET_H}x${TARGET_W}")
-                                }
-                            }
-
-                            chain.proceed(args.toTypedArray())
-                        } catch (t: Throwable) {
-                            log("[DMG createVD CALLBACK ERROR]", t)
-                            chain.proceed()
-                        }
-                    }
-                    log("[+] Hooked DMG.createVirtualDisplay(${params.joinToString(", ") { it.simpleName }})")
-                } catch (t: Throwable) {
-                    log("[!] Failed to hook DMG.createVD: ${t.message}")
-                }
-            }
-        } catch (t: Throwable) {
-            log("hookDisplayManagerGlobal FAILED", t)
-        }
-    }
-
-    // =============================================
-    // Hook MediaProjection.createVirtualDisplay (旧式 8/6 参数)
-    // 兼容旧版 Android 直接传 int width/height 的路径
-    // =============================================
-    private fun hookVirtualDisplay() {
-        try {
-            val mpClass = MediaProjection::class.java
-            val surfaceClass = Class.forName("android.view.Surface")
-            val vdCallbackClass = Class.forName("android.hardware.display.VirtualDisplay\$Callback")
-            val handlerClass = Class.forName("android.os.Handler")
-
-            // 8-arg overload: (String, int, int, int, int, Surface, Callback, Handler)
-            try {
-                val createVD8 = mpClass.getDeclaredMethod(
-                    "createVirtualDisplay",
-                    String::class.java,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                    surfaceClass,
-                    vdCallbackClass,
-                    handlerClass
-                )
-
-                deoptimize(createVD8)
-
-                hook(createVD8).intercept { chain ->
-                    try {
-                        val args = chain.args
-                        val w = args[1] as Int
-                        val h = args[2] as Int
-
-                        log("[createVirtualDisplay(8)] BEFORE: ${w}x${h}")
-
-                        if (w == ORIG_W && h == ORIG_H) {
-                            args[1] = TARGET_W
-                            args[2] = TARGET_H
-                            log("[HOOK VD-8] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
-                        } else if (w == ORIG_H && h == ORIG_W) {
-                            args[1] = TARGET_H
-                            args[2] = TARGET_W
-                            log("[HOOK VD-8] ${w}x${h} -> ${TARGET_H}x${TARGET_W}")
-                        }
-
-                        chain.proceed(args.toTypedArray())
-                    } catch (t: Throwable) {
-                        log("[VD-8 CALLBACK ERROR]", t)
-                        chain.proceed()
-                    }
-                }
-
-                log("[+] VirtualDisplay 8-arg hook installed")
-            } catch (_: Throwable) {}
-
-        } catch (t: Throwable) {
-            log("hookVirtualDisplay FAILED", t)
-        }
-    }
-
-    // =============================================
-    // Hook DisplayManager.createVirtualDisplay (兼容)
+    // Hook DisplayManager.createVirtualDisplay
     // =============================================
     private fun hookDisplayManagerCreateVirtualDisplay() {
         try {
-            val dmClass = Class.forName("android.hardware.display.DisplayManager")
+            val dmClass = DisplayManager::class.java
             val surfaceClass = Class.forName("android.view.Surface")
 
-            try {
-                val createVD = dmClass.getDeclaredMethod(
-                    "createVirtualDisplay",
-                    String::class.java,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                    surfaceClass,
-                    Int::class.javaPrimitiveType
-                )
+            // 尝试所有 createVirtualDisplay 重载
+            for (m in dmClass.getDeclaredMethods()) {
+                if (m.name != "createVirtualDisplay") continue
+                val params = m.parameterTypes
+                try {
+                    deoptimize(m)
+                    hook(m).intercept { chain ->
+                        try {
+                            val args = chain.args
+                            log("[DM createVD] ${args.size} args: ${params.joinToString(",") { it.simpleName }}")
 
-                deoptimize(createVD)
+                            // 找 int 参数中的 width/height
+                            val intIndices = params.indices.filter { params[it] == Int::class.javaPrimitiveType }
+                            if (intIndices.size >= 2) {
+                                val wIdx = intIndices[0]
+                                val hIdx = intIndices[1]
+                                val w = args[wIdx] as Int
+                                val h = args[hIdx] as Int
+                                log("[DM createVD] w=$w, h=$h at idx [$wIdx,$hIdx]")
 
-                hook(createVD).intercept { chain ->
-                    try {
-                        val args = chain.args
-                        val w = args[1] as Int
-                        val h = args[2] as Int
+                                if (w == ORIG_W && h == ORIG_H) {
+                                    args[wIdx] = TARGET_W
+                                    args[hIdx] = TARGET_H
+                                    log("[HOOK DM createVD] -> ${TARGET_W}x${TARGET_H}")
+                                } else if (w == ORIG_H && h == ORIG_W) {
+                                    args[wIdx] = TARGET_H
+                                    args[hIdx] = TARGET_W
+                                    log("[HOOK DM createVD] -> ${TARGET_H}x${TARGET_W}")
+                                }
+                            }
 
-                        log("[DisplayManager VD] BEFORE: ${w}x${h}")
+                            // 对 VirtualDisplayConfig 等对象参数，反射重映射内部分辨率字段
+                            for (i in args.indices) {
+                                val arg = args[i] ?: continue
+                                if (arg.javaClass.name.contains("VirtualDisplayConfig")) {
+                                    log("[DM createVD] config arg[$i]=${arg.javaClass.name}")
+                                    dumpFields(arg, "dm.config$i")
+                                    modifyIntFields(arg, "dm.config$i")
+                                }
+                            }
 
-                        if (w == ORIG_W && h == ORIG_H) {
-                            args[1] = TARGET_W
-                            args[2] = TARGET_H
-                            log("[HOOK DM VD] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
-                        } else if (w == ORIG_H && h == ORIG_W) {
-                            args[1] = TARGET_H
-                            args[2] = TARGET_W
-                            log("[HOOK DM VD] ${w}x${h} -> ${TARGET_H}x${TARGET_W}")
+                            chain.proceed(args.toTypedArray())
+                        } catch (t: Throwable) {
+                            log("[DM createVD CALLBACK ERROR]", t)
+                            chain.proceed()
                         }
-
-                        chain.proceed(args.toTypedArray())
-                    } catch (t: Throwable) {
-                        log("[DM VD CALLBACK ERROR]", t)
-                        chain.proceed()
                     }
+                    log("[+] DisplayManager.createVirtualDisplay(${params.joinToString(",") { it.simpleName }}) hooked")
+                } catch (t: Throwable) {
+                    log("[!] Failed to hook DM.createVD: ${t.message}")
                 }
-
-                log("[+] DisplayManager.createVirtualDisplay hook installed")
-            } catch (_: Throwable) {}
-
+            }
         } catch (t: Throwable) {
             log("hookDisplayManagerCreateVirtualDisplay FAILED", t)
         }
     }
 
+    private fun hookVirtualDisplayResize() {
+        try {
+            val vdClass = Class.forName("android.hardware.display.VirtualDisplay")
+            for (m in vdClass.getDeclaredMethods()) {
+                if (m.name == "resize") {
+                    deoptimize(m)
+                    hook(m).intercept { chain ->
+                        val args = chain.args
+                        val w = args[0] as Int
+                        val h = args[1] as Int
+                        log("[VD.resize BEFORE] ${w}x${h}")
+                        if (w == ORIG_W && h == ORIG_H) {
+                            args[0] = TARGET_W
+                            args[1] = TARGET_H
+                            log("[HOOK VD.resize] ${w}x${h} -> ${TARGET_W}x${TARGET_H}")
+                        }
+                        chain.proceed(args.toTypedArray())
+                    }
+                    log("[+] VirtualDisplay.resize hooked")
+                }
+            }
+        } catch (t: Throwable) {
+            log("[!] VirtualDisplay.resize hook failed: ${t.message}")
+        }
+    }
+
     // =============================================
-    // Hook MediaCodec.configure (日志 + 查看最终 Format)
+    // Hook 应用层包装类 i4.u（app 代码，始终可拦截）
+    // 这是主修复入口：在 App 调用框架 createVirtualDisplay 之前，
+    // 直接反射修改配置对象 o 里的宽高字段，绕开框架方法 AOT 内联问题。
+    // =============================================
+    private fun hookI4UClass(classLoader: ClassLoader) {
+        try {
+            val uCls = classLoader.loadClass("i4.u")
+            var hooked = 0
+            for (m in uCls.declaredMethods) {
+                val params = m.parameterTypes
+                // 只 hook 第一个参数为 MediaProjection 的重载（即 createVirtualDisplay 包装）
+                if (params.isEmpty()) continue
+                if (params[0].name != "android.media.projection.MediaProjection") continue
+                try {
+                    deoptimize(m)
+                    val mName = m.name
+                    val paramSig = params.joinToString(",") { it.simpleName }
+                    hook(m).intercept { chain ->
+                        try {
+                            log("[i4.u.$mName] CALLED ($paramSig)")
+                            // 扫描所有对象参数：dump 字段 + 重映射分辨率 int 字段
+                            for (i in chain.args.indices) {
+                                val arg = chain.args[i] ?: continue
+                                val cn = arg.javaClass.name
+                                // 跳过框架/JDK 类型（Surface、MediaProjection、Callback、Handler、String 等）
+                                if (cn.startsWith("android.") || cn.startsWith("java.") ||
+                                    cn.startsWith("kotlin.") || cn.startsWith("androidx.")
+                                ) continue
+                                log("[i4.u.$mName] arg[$i] type=$cn")
+                                dumpFields(arg, "i4u.$mName.arg$i")
+                                modifyIntFields(arg, "i4u.$mName.arg$i")
+                            }
+                            // 对象字段是就地修改的，直接 proceed 即可
+                            chain.proceed()
+                        } catch (t: Throwable) {
+                            log("[i4.u.$mName CALLBACK ERROR]", t)
+                            chain.proceed()
+                        }
+                    }
+                    hooked++
+                    log("[+] i4.u.$mName($paramSig) hooked")
+                } catch (t: Throwable) {
+                    log("[!] Failed to hook i4.u.${m.name}: ${t.message}")
+                }
+            }
+            if (hooked == 0) {
+                log("[!] i4.u: 未找到以 MediaProjection 为首参的重载，无法 hook")
+            }
+        } catch (t: Throwable) {
+            log("hookI4UClass FAILED", t)
+        }
+    }
+
+    // =============================================
+    // Hook MediaCodec.configure (日志 + 调用栈追踪)
     // =============================================
     private fun hookMediaCodecConfigureLog() {
         try {
@@ -702,6 +598,14 @@ class HookModule : XposedModule() {
                     log("[configure] Codec: $name")
                     log("[configure] Format: $format")
 
+                    // 打印调用栈，追踪分辨率是从哪里传入的
+                    val stackTrace = Thread.currentThread().stackTrace
+                        .filter { it.className.contains("oplus") || it.className.startsWith("e4.") || it.className.startsWith("i4.") || it.className.startsWith("d4.") }
+                        .joinToString("\n") { "  at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})" }
+                    if (stackTrace.isNotEmpty()) {
+                        log("[configure] App call stack:\n$stackTrace")
+                    }
+
                     chain.proceed()
                 } catch (t: Throwable) {
                     log("[configure CALLBACK ERROR]", t)
@@ -714,5 +618,38 @@ class HookModule : XposedModule() {
         } catch (t: Throwable) {
             log("HOOK configure FAILED", t)
         }
+    }
+
+    private fun dumpFields(obj: Any?, tag: String) {
+        if (obj == null) { log("[$tag] null"); return }
+        try {
+            for (f in obj.javaClass.declaredFields) {
+                try {
+                    f.isAccessible = true
+                    log("[$tag] ${f.name} (${f.type.simpleName}) = ${f.get(obj)}")
+                } catch (_: Throwable) {}
+            }
+        } catch (t: Throwable) { log("dumpFields $tag failed", t) }
+    }
+
+    private fun modifyIntFields(obj: Any?, tag: String) {
+        if (obj == null) return
+        try {
+            for (f in obj.javaClass.declaredFields) {
+                try {
+                    f.isAccessible = true
+                    if (f.type == Int::class.javaPrimitiveType) {
+                        val v = f.getInt(obj)
+                        if (v == ORIG_W) {
+                            f.setInt(obj, TARGET_W)
+                            log("[HOOK $tag.${f.name}] $v -> $TARGET_W")
+                        } else if (v == ORIG_H) {
+                            f.setInt(obj, TARGET_H)
+                            log("[HOOK $tag.${f.name}] $v -> $TARGET_H")
+                        }
+                    }
+                } catch (_: Throwable) {}
+            }
+        } catch (t: Throwable) { log("modifyIntFields $tag failed", t) }
     }
 }
