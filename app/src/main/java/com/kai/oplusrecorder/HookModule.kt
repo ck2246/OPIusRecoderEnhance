@@ -22,11 +22,32 @@ class HookModule : XposedModule() {
         // 目标分辨率（竖屏基准）
         private const val TARGET_W = 1272
         private const val TARGET_H = 2772
+
+        // ---- 色彩配置默认值（对应 color.js：BT.709 + Full Range）----
+        // 实际值由模块 UI 保存到 settings，可运行时配置，见下方成员变量
+        // color-standard / color-matrix: 1=BT709, 2=BT601_PAL, 4=BT601_NTSC, 6=BT2020
+        private const val DEFAULT_COLOR_STANDARD = 1   // BT.709（原 bt601）
+        // color-range: 1=FULL(0-255), 2=LIMITED(16-235)
+        private const val DEFAULT_COLOR_RANGE = 1      // Full（原 limited）
+        // color-transfer: 3=SDR, 6=ST2084, 7=HLG
+        private const val DEFAULT_COLOR_TRANSFER = 3   // SDR
+
+        // MediaFormat 色彩相关 key
+        private const val KEY_COLOR_STANDARD = "color-standard"
+        private const val KEY_COLOR_RANGE = "color-range"
+        private const val KEY_COLOR_TRANSFER = "color-transfer"
+        private const val KEY_COLOR_MATRIX = "color-matrix"
     }
 
     // 从模块 UI 读取的用户设置
     private var videoBitrate: Int = 30_000_000
-    private var audioBitrate: Int = 320_000
+    private var audioBitrate: Int = 288_000
+
+    // 色彩设置（由模块 UI 配置，onPackageReady 时读取）
+    private var colorEnabled: Boolean = true
+    private var colorStandard: Int = DEFAULT_COLOR_STANDARD
+    private var colorRange: Int = DEFAULT_COLOR_RANGE
+    private var colorTransfer: Int = DEFAULT_COLOR_TRANSFER
 
     private fun log(msg: String) {
         log(Log.INFO, TAG, msg)
@@ -92,8 +113,12 @@ class HookModule : XposedModule() {
         try {
             val prefs = getRemotePreferences("settings")
             videoBitrate = prefs.getInt("video_bitrate", 30_000_000)
-            audioBitrate = prefs.getInt("audio_bitrate", 320_000)
-            log("Settings: videoBitrate=$videoBitrate, audioBitrate=$audioBitrate")//这里logcat有输出
+            audioBitrate = prefs.getInt("audio_bitrate", 288_000)
+            colorEnabled = prefs.getBoolean("color_enabled", true)
+            colorStandard = prefs.getInt("color_standard", DEFAULT_COLOR_STANDARD)
+            colorRange = prefs.getInt("color_range", DEFAULT_COLOR_RANGE)
+            log("Settings: videoBitrate=$videoBitrate, audioBitrate=$audioBitrate, " +
+                    "colorEnabled=$colorEnabled, colorStandard=$colorStandard, colorRange=$colorRange")
         } catch (t: Throwable) {
             log("Failed to read settings, using defaults", t)
         }
@@ -101,17 +126,12 @@ class HookModule : XposedModule() {
         if (isMainProcess) {
             log("========== HOOKING MAIN PROCESS ==========")
 
-            // ---- 诊断：枚举所有可用的 Hook 目标 ----
-            diagnoseAvailableHooks(param.classLoader)
-
             // ---- 框架类 Hook（可能不触发，用于验证） ----
             hookMediaProjectionCreateVirtualDisplay()
             hookMediaFormatSetInteger()
             hookMediaFormatCreateVideoFormat()
-            hookMediaCodecConfigureLog()
-            hookDisplayGetMetrics()
+            hookMediaCodecConfigure()
             hookDisplayManagerCreateVirtualDisplay()
-
             hookVirtualDisplayResize()
 
             // 应用层包装类 i4.u（App 代码，始终可被 Xposed 拦截）—— 主修复入口
@@ -119,88 +139,6 @@ class HookModule : XposedModule() {
         } else {
             // 子进程：只记录信息
             log("Child process: $processSuffix - functional hooks limited to main process")
-        }
-    }
-
-    // =============================================
-    // 诊断：枚举应用内部类，寻找分辨率相关的 Hook 点
-    // =============================================
-    private fun diagnoseAvailableHooks(classLoader: ClassLoader) {
-        // 1. 检查 e4.h 是否仍然存在（旧版 OPlus 混淆类）
-        try {
-            val cls = Class.forName("e4.h", false, classLoader)
-            log("[DIAG] e4.h EXISTS, methods:")
-            for (m in cls.declaredMethods) {
-                log("  ${m.name}(${m.parameterTypes.joinToString(",") { it.simpleName }})")
-            }
-        } catch (_: Throwable) {
-            log("[DIAG] e4.h NOT FOUND (class mapping may have changed)")
-        }
-
-        // 2. 扫描常见混淆包名，寻找含 int,int 参数的方法（可能是分辨率传入点）
-        val suspectPackages = setOf("e4", "i4", "d4", "f4", "g4", "h4")
-        for (pkg in suspectPackages) {
-            try {
-                // 尝试枚举 dex 中的类（通过已知类推断）
-                val knownClasses = listOf(
-                    "$pkg.h", "$pkg.o", "$pkg.u", "$pkg.a", "$pkg.b",
-                    "$pkg.c", "$pkg.d", "$pkg.e", "$pkg.f", "$pkg.g"
-                )
-                for (cn in knownClasses) {
-                    try {
-                        val cls = Class.forName(cn, false, classLoader)
-                        for (m in cls.declaredMethods) {
-                            val params = m.parameterTypes
-                            // 找含有两个连续 int 参数的方法（可能是 width, height）
-                            for (i in 0 until params.size - 1) {
-                                if (params[i] == Int::class.javaPrimitiveType &&
-                                    params[i + 1] == Int::class.javaPrimitiveType
-                                ) {
-                                    log("[DIAG] $cn.${m.name} has (int,int) at [$i,${i + 1}]: ${params.joinToString(",") { it.simpleName }}")
-                                }
-                            }
-                        }
-                    } catch (_: Throwable) {}
-                }
-            } catch (_: Throwable) {}
-        }
-
-        // 3. 检查 MediaProjection 的所有 createVirtualDisplay 重载
-        try {
-            val mpClass = MediaProjection::class.java
-            log("[DIAG] MediaProjection.createVirtualDisplay overloads:")
-            for (m in mpClass.getDeclaredMethods()) {
-                if (m.name == "createVirtualDisplay") {
-                    log("  (${m.parameterTypes.joinToString(",") { it.simpleName }})")
-                }
-            }
-        } catch (t: Throwable) {
-            log("[DIAG] MediaProjection scan failed: ${t.message}")
-        }
-
-        // 4. 检查 DisplayManager 的 createVirtualDisplay
-        try {
-            val dmClass = DisplayManager::class.java
-            log("[DIAG] DisplayManager.createVirtualDisplay overloads:")
-            for (m in dmClass.getDeclaredMethods()) {
-                if (m.name == "createVirtualDisplay") {
-                    log("  (${m.parameterTypes.joinToString(",") { it.simpleName }})")
-                }
-            }
-        } catch (t: Throwable) {
-            log("[DIAG] DisplayManager scan failed: ${t.message}")
-        }
-
-        // 在 diagnoseAvailableHooks 中添加
-        try {
-            val uCls = classLoader.loadClass("i4.u")
-            log("[DIAG] i4.u EXISTS, methods:")
-            for (m in uCls.declaredMethods) {
-                val params = m.parameterTypes.joinToString { it.simpleName }
-                log("  ${m.name}($params)")
-            }
-        } catch (_: Throwable) {
-            log("[DIAG] i4.u NOT FOUND")
         }
     }
 
@@ -317,6 +255,13 @@ class HookModule : XposedModule() {
         if (key == "bitrate" && value > 1_000_000) return videoBitrate
         // 修改音频码率（< 1Mbps 视为音频）
         if (key == "bitrate" && value < 1_000_000) return audioBitrate
+        // 色彩空间与范围（由 UI 配置，对应 color.js 新增）；关闭时不改写，保持 App 原值
+        if (colorEnabled) {
+            if (key == KEY_COLOR_STANDARD) return colorStandard
+            if (key == KEY_COLOR_RANGE) return colorRange
+            if (key == KEY_COLOR_TRANSFER) return colorTransfer
+            if (key == KEY_COLOR_MATRIX) return colorStandard
+        }
         return null
     }
 
@@ -358,75 +303,74 @@ class HookModule : XposedModule() {
     }
 
     // =============================================
-    // Hook Display.getMetrics / getRealMetrics
-    // 从源头修改应用看到的屏幕分辨率
+    // Hook MediaCodec.configure（所有含 MediaFormat 的重载）
+    // 对应 color.js：在编码器 configure 前强制注入色彩参数，
+    // 防止 App 未显式调用 setInteger 导致色彩参数缺失（保持 bt601+limited）。
+    // 这是色彩修改的主入口：configure 为大型 native 方法，不会被 AOT 内联，触发可靠。
     // =============================================
-    private fun hookDisplayGetMetrics() {
+    private fun hookMediaCodecConfigure() {
         try {
-            val displayClass = Display::class.java
-
-            // getMetrics(Point)
-            try {
-                val getMetrics = displayClass.getDeclaredMethod(
-                    "getMetrics", android.graphics.Point::class.java
-                )
-                deoptimize(getMetrics)
-                hook(getMetrics).intercept { chain ->
-                    try {
-                        chain.proceed()
-                        val point = chain.args[0] as android.graphics.Point
-                        log("[Display.getMetrics] ${point.x}x${point.y}")
-                        if (point.x == ORIG_W && point.y == ORIG_H) {
-                            point.x = TARGET_W
-                            point.y = TARGET_H
-                            log("[HOOK Display.getMetrics] -> ${TARGET_W}x${TARGET_H}")
-                        } else if (point.x == ORIG_H && point.y == ORIG_W) {
-                            point.x = TARGET_H
-                            point.y = TARGET_W
-                            log("[HOOK Display.getMetrics] -> ${TARGET_H}x${TARGET_W}")
+            val codecClass = MediaCodec::class.java
+            var hooked = 0
+            for (m in codecClass.declaredMethods) {
+                if (m.name != "configure") continue
+                val params = m.parameterTypes
+                // 仅处理带 MediaFormat 参数的重载
+                val fmtIdx = params.indexOfFirst { it == MediaFormat::class.java }
+                if (fmtIdx < 0) continue
+                val sig = params.joinToString(",") { it.simpleName }
+                try {
+                    deoptimize(m)
+                    hook(m).intercept { chain ->
+                        try {
+                            val codec = chain.thisObject as? MediaCodec
+                            val name = try { codec?.name ?: "" } catch (t: Throwable) { "" }
+                            val format = chain.args[fmtIdx] as? MediaFormat
+                            injectColorParams(name, format)
+                            chain.proceed()
+                        } catch (t: Throwable) {
+                            log("[CONFIG CALLBACK ERROR]", t)
+                            chain.proceed()
                         }
-                    } catch (t: Throwable) {
-                        log("[Display.getMetrics CALLBACK ERROR]", t)
-                        chain.proceed()
                     }
+                    hooked++
+                    log("[+] MediaCodec.configure($sig) hooked")
+                } catch (t: Throwable) {
+                    log("[!] Failed to hook MediaCodec.configure($sig): ${t.message}")
                 }
-                log("[+] Display.getMetrics hook installed")
-            } catch (t: Throwable) {
-                log("[!] Display.getMetrics hook failed: ${t.message}")
             }
-
-            // getRealMetrics(Point)
-            try {
-                val getRealMetrics = displayClass.getDeclaredMethod(
-                    "getRealMetrics", android.graphics.Point::class.java
-                )
-                deoptimize(getRealMetrics)
-                hook(getRealMetrics).intercept { chain ->
-                    try {
-                        chain.proceed()
-                        val point = chain.args[0] as android.graphics.Point
-                        log("[Display.getRealMetrics] ${point.x}x${point.y}")
-                        if (point.x == ORIG_W && point.y == ORIG_H) {
-                            point.x = TARGET_W
-                            point.y = TARGET_H
-                            log("[HOOK Display.getRealMetrics] -> ${TARGET_W}x${TARGET_H}")
-                        } else if (point.x == ORIG_H && point.y == ORIG_W) {
-                            point.x = TARGET_H
-                            point.y = TARGET_W
-                            log("[HOOK Display.getRealMetrics] -> ${TARGET_H}x${TARGET_W}")
-                        }
-                    } catch (t: Throwable) {
-                        log("[Display.getRealMetrics CALLBACK ERROR]", t)
-                        chain.proceed()
-                    }
-                }
-                log("[+] Display.getRealMetrics hook installed")
-            } catch (t: Throwable) {
-                log("[!] Display.getRealMetrics hook failed: ${t.message}")
+            if (hooked == 0) {
+                log("[!] MediaCodec.configure: 未找到含 MediaFormat 参数的重载")
             }
-
         } catch (t: Throwable) {
-            log("hookDisplayGetMetrics FAILED", t)
+            log("hookMediaCodecConfigure FAILED", t)
+        }
+    }
+
+    /**
+     * 对视频编码器的 MediaFormat 强制注入色彩参数（BT.709 + Full Range）。
+     * 通过 mime / codec 名称判定是否为视频编码器，音频编码器不受影响。
+     */
+    private fun injectColorParams(codecName: String, format: MediaFormat?) {
+        if (format == null) return
+        if (!colorEnabled) {
+            log("[CONFIG] 色彩优化已关闭，跳过注入")
+            return
+        }
+        val mime = try { format.getString(MediaFormat.KEY_MIME) ?: "" } catch (t: Throwable) { "" }
+        val lower = codecName.lowercase()
+        val isVideo = mime.startsWith("video/") ||
+                lower.contains("video") || lower.contains("avc") || lower.contains("hevc")
+        log("[CONFIG] Codec=$codecName, mime=$mime, isVideo=$isVideo")
+        if (!isVideo) return
+        try {
+            format.setInteger(KEY_COLOR_STANDARD, colorStandard)
+            format.setInteger(KEY_COLOR_RANGE, colorRange)
+            format.setInteger(KEY_COLOR_TRANSFER, colorTransfer)
+            format.setInteger(KEY_COLOR_MATRIX, colorStandard)
+            log("[CONFIG] 已注入色彩参数 (standard=$colorStandard, range=$colorRange, transfer=$colorTransfer)")
+        } catch (t: Throwable) {
+            log("[CONFIG] 注入色彩参数失败，硬件可能不支持: ${t.message}")
         }
     }
 
@@ -474,7 +418,7 @@ class HookModule : XposedModule() {
                                 val arg = args[i] ?: continue
                                 if (arg.javaClass.name.contains("VirtualDisplayConfig")) {
                                     log("[DM createVD] config arg[$i]=${arg.javaClass.name}")
-                                    dumpFields(arg, "dm.config$i")
+//                                    dumpFields(arg, "dm.config$i")
                                     modifyIntFields(arg, "dm.config$i")
                                 }
                             }
@@ -551,7 +495,9 @@ class HookModule : XposedModule() {
                                     cn.startsWith("kotlin.") || cn.startsWith("androidx.")
                                 ) continue
                                 log("[i4.u.$mName] arg[$i] type=$cn")
-                                dumpFields(arg, "i4u.$mName.arg$i")
+
+//                                dumpFields(arg, "i4u.$mName.arg$i")
+
                                 modifyIntFields(arg, "i4u.$mName.arg$i")
                             }
                             // 对象字段是就地修改的，直接 proceed 即可
@@ -575,62 +521,6 @@ class HookModule : XposedModule() {
         }
     }
 
-    // =============================================
-    // Hook MediaCodec.configure (日志 + 调用栈追踪)
-    // =============================================
-    private fun hookMediaCodecConfigureLog() {
-        try {
-            val configure = MediaCodec::class.java.getDeclaredMethod(
-                "configure",
-                MediaFormat::class.java,
-                Class.forName("android.view.Surface"),
-                Class.forName("android.media.MediaCrypto"),
-                Int::class.javaPrimitiveType
-            )
-
-            deoptimize(configure)
-
-            hook(configure).intercept { chain ->
-                try {
-                    val format = chain.args[0] as? MediaFormat
-                    val name = (chain.thisObject as MediaCodec).name
-
-                    log("[configure] Codec: $name")
-                    log("[configure] Format: $format")
-
-                    // 打印调用栈，追踪分辨率是从哪里传入的
-                    val stackTrace = Thread.currentThread().stackTrace
-                        .filter { it.className.contains("oplus") || it.className.startsWith("e4.") || it.className.startsWith("i4.") || it.className.startsWith("d4.") }
-                        .joinToString("\n") { "  at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})" }
-                    if (stackTrace.isNotEmpty()) {
-                        log("[configure] App call stack:\n$stackTrace")
-                    }
-
-                    chain.proceed()
-                } catch (t: Throwable) {
-                    log("[configure CALLBACK ERROR]", t)
-                    chain.proceed()
-                }
-            }
-
-            log("[+] MediaCodec.configure hook installed")
-
-        } catch (t: Throwable) {
-            log("HOOK configure FAILED", t)
-        }
-    }
-
-    private fun dumpFields(obj: Any?, tag: String) {
-        if (obj == null) { log("[$tag] null"); return }
-        try {
-            for (f in obj.javaClass.declaredFields) {
-                try {
-                    f.isAccessible = true
-                    log("[$tag] ${f.name} (${f.type.simpleName}) = ${f.get(obj)}")
-                } catch (_: Throwable) {}
-            }
-        } catch (t: Throwable) { log("dumpFields $tag failed", t) }
-    }
 
     private fun modifyIntFields(obj: Any?, tag: String) {
         if (obj == null) return
