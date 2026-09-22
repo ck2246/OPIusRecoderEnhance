@@ -7,4 +7,16 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- 界面配色 -->
+    <color name="screen_bg">#F2F3F7</color>
+    <color name="card_bg">#FFFFFFFF</color>
+    <color name="input_bg">#F3F4F8</color>
+    <color name="divider">#E5E7EB</color>
+    <color name="accent">#5B5FE9</color>
+    <color name="accent_soft">#1A5B5FE9</color>
+    <color name="grad_start">#6C63FF</color>
+    <color name="grad_end">#48C6EF</color>
+    <color name="text_primary">#1A1A2E</color>
+    <color name="text_secondary">#6B7280</color>
 </resources>

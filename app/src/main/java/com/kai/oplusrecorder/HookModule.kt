@@ -29,14 +29,30 @@ class HookModule : XposedModule() {
         private const val DEFAULT_COLOR_STANDARD = 1   // BT.709（原 bt601）
         // color-range: 1=FULL(0-255), 2=LIMITED(16-235)
         private const val DEFAULT_COLOR_RANGE = 1      // Full（原 limited）
-        // color-transfer: 3=SDR, 6=ST2084, 7=HLG
+        // color-transfer: 3=SDR, 6=ST2084(PQ), 7=HLG
         private const val DEFAULT_COLOR_TRANSFER = 3   // SDR
+        private const val TRANSFER_ST2084 = 6          // PQ（HDR10）
+        private const val TRANSFER_HLG = 7             // HLG
+
+        // HDR 模式：0=关闭(SDR 8-bit), 1=HLG 10-bit, 2=HDR10(PQ) 10-bit
+        private const val HDR_MODE_OFF = 0
+        private const val HDR_MODE_HLG = 1
+        private const val HDR_MODE_HDR10 = 2
+
+        // HDR 开启时强制的 BT.2020 原色/矩阵值
+        private const val COLOR_STANDARD_BT2020 = 6
+
+        // HEVC 10-bit profile：必须用带 HDR 语义的档位，否则编码器按 SDR 推导 VUI，传输特性退回 bt709
+        private const val PROFILE_MAIN10 = 2             // 10-bit，但 VUI 默认 bt709(SDR)
+        private const val PROFILE_MAIN10_HDR10 = 0x1000  // 4096：10-bit + PQ
+        private const val PROFILE_MAIN10_HLG10 = 0x2000  // 8192：10-bit + HLG
 
         // MediaFormat 色彩相关 key
         private const val KEY_COLOR_STANDARD = "color-standard"
         private const val KEY_COLOR_RANGE = "color-range"
         private const val KEY_COLOR_TRANSFER = "color-transfer"
         private const val KEY_COLOR_MATRIX = "color-matrix"
+        private const val KEY_PROFILE = "profile"
     }
 
     // 从模块 UI 读取的用户设置
@@ -48,6 +64,7 @@ class HookModule : XposedModule() {
     private var colorStandard: Int = DEFAULT_COLOR_STANDARD
     private var colorRange: Int = DEFAULT_COLOR_RANGE
     private var colorTransfer: Int = DEFAULT_COLOR_TRANSFER
+    private var hdrMode: Int = HDR_MODE_OFF
 
     private fun log(msg: String) {
         log(Log.INFO, TAG, msg)
@@ -117,8 +134,9 @@ class HookModule : XposedModule() {
             colorEnabled = prefs.getBoolean("color_enabled", true)
             colorStandard = prefs.getInt("color_standard", DEFAULT_COLOR_STANDARD)
             colorRange = prefs.getInt("color_range", DEFAULT_COLOR_RANGE)
+            hdrMode = prefs.getInt("hdr_mode", HDR_MODE_OFF)
             log("Settings: videoBitrate=$videoBitrate, audioBitrate=$audioBitrate, " +
-                    "colorEnabled=$colorEnabled, colorStandard=$colorStandard, colorRange=$colorRange")
+                    "colorEnabled=$colorEnabled, colorStandard=$colorStandard, colorRange=$colorRange, hdrMode=$hdrMode")
         } catch (t: Throwable) {
             log("Failed to read settings, using defaults", t)
         }
@@ -255,12 +273,19 @@ class HookModule : XposedModule() {
         if (key == "bitrate" && value > 1_000_000) return videoBitrate
         // 修改音频码率（< 1Mbps 视为音频）
         if (key == "bitrate" && value < 1_000_000) return audioBitrate
-        // 色彩空间与范围（由 UI 配置，对应 color.js 新增）；关闭时不改写，保持 App 原值
+        // 色彩空间与范围（由 UI 配置）；关闭时不改写，保持 App 原值
         if (colorEnabled) {
-            if (key == KEY_COLOR_STANDARD) return colorStandard
+            val hdrOn = hdrMode != HDR_MODE_OFF
+            val effStandard = if (hdrOn) COLOR_STANDARD_BT2020 else colorStandard
+            val effTransfer = when {
+                !hdrOn -> colorTransfer
+                hdrMode == HDR_MODE_HDR10 -> TRANSFER_ST2084
+                else -> TRANSFER_HLG
+            }
+            if (key == KEY_COLOR_STANDARD) return effStandard
             if (key == KEY_COLOR_RANGE) return colorRange
-            if (key == KEY_COLOR_TRANSFER) return colorTransfer
-            if (key == KEY_COLOR_MATRIX) return colorStandard
+            if (key == KEY_COLOR_TRANSFER) return effTransfer
+            if (key == KEY_COLOR_MATRIX) return effStandard
         }
         return null
     }
@@ -326,7 +351,7 @@ class HookModule : XposedModule() {
                             val codec = chain.thisObject as? MediaCodec
                             val name = try { codec?.name ?: "" } catch (t: Throwable) { "" }
                             val format = chain.args[fmtIdx] as? MediaFormat
-                            injectColorParams(name, format)
+                            injectColorParams(codec, name, format)
                             chain.proceed()
                         } catch (t: Throwable) {
                             log("[CONFIG CALLBACK ERROR]", t)
@@ -348,10 +373,14 @@ class HookModule : XposedModule() {
     }
 
     /**
-     * 对视频编码器的 MediaFormat 强制注入色彩参数（BT.709 + Full Range）。
-     * 通过 mime / codec 名称判定是否为视频编码器，音频编码器不受影响。
+     * 对视频编码器的 MediaFormat 强制注入色彩参数。
+     * - SDR 模式：注入 UI 选择的色彩标准/范围，传输特性为 SDR。
+     * - HDR 模式：强制 BT.2020 原色/矩阵 + HLG/PQ 传输特性，并注入带 HDR 语义的
+     *   10-bit profile（Main10HLG10 / Main10HDR10）。这是同时拿到 10-bit 与正确传输特性
+     *   的关键：仅设 Main10 会让编码器按 SDR 推导 VUI，传输特性退回 bt709。
+     * 通过 mime / codec 名称判定视频编码器，音频编码器不受影响。
      */
-    private fun injectColorParams(codecName: String, format: MediaFormat?) {
+    private fun injectColorParams(codec: MediaCodec?, codecName: String, format: MediaFormat?) {
         if (format == null) return
         if (!colorEnabled) {
             log("[CONFIG] 色彩优化已关闭，跳过注入")
@@ -361,16 +390,63 @@ class HookModule : XposedModule() {
         val lower = codecName.lowercase()
         val isVideo = mime.startsWith("video/") ||
                 lower.contains("video") || lower.contains("avc") || lower.contains("hevc")
-        log("[CONFIG] Codec=$codecName, mime=$mime, isVideo=$isVideo")
+        log("[CONFIG] Codec=$codecName, mime=$mime, isVideo=$isVideo, hdrMode=$hdrMode")
         if (!isVideo) return
+
+        val hdrOn = hdrMode != HDR_MODE_OFF
+        // HDR 开启时强制 BT.2020 原色/矩阵与 HLG/PQ 传输特性，覆盖 UI 的 SDR 选择
+        val effStandard = if (hdrOn) COLOR_STANDARD_BT2020 else colorStandard
+        val effTransfer = when {
+            !hdrOn -> colorTransfer
+            hdrMode == HDR_MODE_HDR10 -> TRANSFER_ST2084
+            else -> TRANSFER_HLG
+        }
         try {
-            format.setInteger(KEY_COLOR_STANDARD, colorStandard)
+            format.setInteger(KEY_COLOR_STANDARD, effStandard)
             format.setInteger(KEY_COLOR_RANGE, colorRange)
-            format.setInteger(KEY_COLOR_TRANSFER, colorTransfer)
-            format.setInteger(KEY_COLOR_MATRIX, colorStandard)
-            log("[CONFIG] 已注入色彩参数 (standard=$colorStandard, range=$colorRange, transfer=$colorTransfer)")
+            format.setInteger(KEY_COLOR_TRANSFER, effTransfer)
+            format.setInteger(KEY_COLOR_MATRIX, effStandard)
+
+            if (hdrOn) {
+                val profile = pickHdrProfile(codec, mime, effTransfer)
+                if (profile != null) {
+                    format.setInteger(KEY_PROFILE, profile)
+                    log("[CONFIG] 注入 profile=$profile (10-bit + HDR)")
+                } else {
+                    log("[CONFIG] 无可用 10-bit profile，保持编码器默认（可能 8-bit）")
+                }
+            }
+            log("[CONFIG] 已注入色彩参数 (standard=$effStandard, range=$colorRange, transfer=$effTransfer)")
         } catch (t: Throwable) {
             log("[CONFIG] 注入色彩参数失败，硬件可能不支持: ${t.message}")
+        }
+    }
+
+    /**
+     * 查询编码器能力，按传输特性挑选带 HDR 语义的 10-bit profile。
+     * 优先 Main10HLG10(HLG) / Main10HDR10(PQ)；若硬件不暴露该档位，回退 Main10
+     * （此时能拿到 10-bit，但传输特性可能被推导为 bt709）；均不支持则返回 null。
+     * 注意：API 37 已移除 MediaCodecInfo.getCapabilities()，须用 getCapabilitiesForType(mime)。
+     */
+    private fun pickHdrProfile(codec: MediaCodec?, mime: String, transfer: Int): Int? {
+        val profiles = mutableSetOf<Int>()
+        try {
+            val caps = codec?.codecInfo?.getCapabilitiesForType(mime)
+            if (caps != null) {
+                for (pl in caps.profileLevels) {
+                    profiles.add(pl.profile)
+                }
+            }
+        } catch (t: Throwable) {
+            log("[CAPS] 读取编码器能力失败: ${t.message}")
+        }
+        log("[CAPS] $mime 支持的 profiles=$profiles")
+
+        val want = if (transfer == TRANSFER_HLG) PROFILE_MAIN10_HLG10 else PROFILE_MAIN10_HDR10
+        return when {
+            profiles.contains(want) -> want
+            profiles.contains(PROFILE_MAIN10) -> PROFILE_MAIN10
+            else -> null
         }
     }
 

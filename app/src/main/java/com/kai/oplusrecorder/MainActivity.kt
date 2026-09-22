@@ -9,6 +9,7 @@ import android.widget.ImageView
 import android.widget.Spinner
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
 
 class MainActivity : AppCompatActivity() {
 
@@ -20,11 +21,16 @@ class MainActivity : AppCompatActivity() {
     private val colorRangeLabels = arrayOf("Full（0-255）", "Limited（16-235）")
     private val colorRangeValues = intArrayOf(1, 2)
 
+    // HDR 模式选项：显示文本 <-> hdr_mode 设置值（0=关闭, 1=HLG, 2=HDR10/PQ）
+    private val hdrModeLabels = arrayOf("关闭（SDR 8-bit）", "HLG 10-bit（推荐）", "HDR10（PQ）10-bit")
+    private val hdrModeValues = intArrayOf(0, 1, 2)
+
     private lateinit var videoEdit: EditText
     private lateinit var audioEdit: EditText
     private lateinit var colorEnabledCheck: CheckBox
     private lateinit var colorStandardSpinner: Spinner
     private lateinit var colorRangeSpinner: Spinner
+    private lateinit var hdrModeSpinner: Spinner
 
     override fun onCreate(
         savedInstanceState: Bundle?
@@ -40,6 +46,15 @@ class MainActivity : AppCompatActivity() {
         colorEnabledCheck = findViewById(R.id.colorEnabled)
         colorStandardSpinner = findViewById(R.id.colorStandard)
         colorRangeSpinner = findViewById(R.id.colorRange)
+        hdrModeSpinner = findViewById(R.id.hdrMode)
+
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            // 状态栏图标变黑（深色）
+            isAppearanceLightStatusBars = true
+
+            // 如果需要导航栏图标也变黑
+            isAppearanceLightNavigationBars = true
+        }
 
         // 初始化色彩下拉框
         colorStandardSpinner.adapter = ArrayAdapter(
@@ -51,6 +66,11 @@ class MainActivity : AppCompatActivity() {
             this,
             android.R.layout.simple_spinner_dropdown_item,
             colorRangeLabels
+        )
+        hdrModeSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            hdrModeLabels
         )
 
         // 配置就绪后再回填 UI：RemoteSettings.prefs 由 XposedService 异步绑定后才有值，
@@ -90,6 +110,9 @@ class MainActivity : AppCompatActivity() {
         colorRangeSpinner.setSelection(
             indexOfValue(colorRangeValues, prefs.getInt("color_range", 1))
         )
+        hdrModeSpinner.setSelection(
+            indexOfValue(hdrModeValues, prefs.getInt("hdr_mode", 0))
+        )
     }
 
     /** 校验并保存 UI 中的配置到 RemoteSettings。 */
@@ -112,12 +135,14 @@ class MainActivity : AppCompatActivity() {
         val audioBps = audioKbps * 1000
         val standard = colorStandardValues[colorStandardSpinner.selectedItemPosition]
         val range = colorRangeValues[colorRangeSpinner.selectedItemPosition]
+        val hdr = hdrModeValues[hdrModeSpinner.selectedItemPosition]
 
         editor.putInt("video_bitrate", videoBps)
             .putInt("audio_bitrate", audioBps)
             .putBoolean("color_enabled", colorEnabledCheck.isChecked)
             .putInt("color_standard", standard)
             .putInt("color_range", range)
+            .putInt("hdr_mode", hdr)
             .apply()
 
         Toast.makeText(this, "设置已保存", Toast.LENGTH_SHORT).show()
@@ -159,7 +184,7 @@ class MainActivity : AppCompatActivity() {
                 if (success) {
                     Toast.makeText(
                         this,
-                        "已强制停止录屏应用，新码率将在下次录屏时生效",
+                        "已强制停止录屏应用，设置将在下次录屏时生效",
                         Toast.LENGTH_SHORT
                     ).show()
                 } else {
