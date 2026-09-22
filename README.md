@@ -4,7 +4,7 @@
 
 通过 Hook 目标应用的编码与虚拟显示器参数，实现原生录屏设置里**没有开放**的能力：
 
-- **点对点分辨率**：将录制分辨率从 `1080 × 2354` 提升到屏幕物理分辨率 `1272 × 2772`，实现像素点对点的清晰画面。
+- **点对点分辨率**：将录制分辨率从 `1080 × 2354` 提升到屏幕物理分辨率 `1272 × 2772`，实现像素点对点的清晰画面（仅限一加15）。
 - **自定义码率**：视频 / 音频码率自由配置（默认视频 30 Mbps、音频 288 kbps）。
 - **色彩优化**：将色彩空间从默认的 BT.601 + Limited 改为 **BT.709 + Full Range**，色彩更准确、层次更丰富。
 
@@ -104,29 +104,6 @@ app/src/main/
 - **UI**：Android View（AppCompat + ConstraintLayout）
 - **Hook 框架**：libxposed `api:102.0.0`（compileOnly）+ `service:102.0.0`（远程配置）
 - **构建**：Gradle（Kotlin DSL），`compileSdk 37` / `minSdk 29` / `targetSdk 37`
-
----
-
-## 调试
-
-录制时可通过 logcat 过滤 TAG `OplusRecorderHook` 观察 Hook 是否命中：
-
-```bash
-adb logcat -c          # 清空旧日志
-adb logcat | grep OplusRecorderHook
-```
-
-关键日志示例：
-
-```
-Settings: videoBitrate=..., audioBitrate=..., colorEnabled=true, colorStandard=1, colorRange=1
-[i4.u.b] CALLED (MediaProjection,o,Surface,a,Callback,Handler)
-[HOOK i4u.b.arg1.xxx] 1080 -> 1272
-[CONFIG] Codec=...encoder.avc, mime=video/avc, isVideo=true
-[CONFIG] 已注入色彩参数 (standard=1, range=1, transfer=3)
-```
-
-> 注意：`onPackageReady` 阶段打印的都是「Hook 安装」日志；带 `1080 -> 1272`、`已注入色彩参数` 等改值日志只在**真正开始录屏**时才会出现。
 
 ---
 
