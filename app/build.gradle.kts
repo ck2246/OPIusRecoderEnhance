@@ -13,8 +13,8 @@ android {
         applicationId = "com.kai.oplusrecorder"
         minSdk = 29
         targetSdk = 37
-        versionCode = 2
-        versionName = "1.2.0"
+        versionCode = 3
+        versionName = "1.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

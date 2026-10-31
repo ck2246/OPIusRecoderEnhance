@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var colorStandardSpinner: Spinner
     private lateinit var colorRangeSpinner: Spinner
     private lateinit var hdrModeSpinner: Spinner
+    private lateinit var screenshotPngCheck: CheckBox
 
     override fun onCreate(
         savedInstanceState: Bundle?
@@ -47,6 +48,7 @@ class MainActivity : AppCompatActivity() {
         colorStandardSpinner = findViewById(R.id.colorStandard)
         colorRangeSpinner = findViewById(R.id.colorRange)
         hdrModeSpinner = findViewById(R.id.hdrMode)
+        screenshotPngCheck = findViewById(R.id.screenshotPng)
 
         WindowCompat.getInsetsController(window, window.decorView).apply {
             // 状态栏图标变黑（深色）
@@ -85,11 +87,11 @@ class MainActivity : AppCompatActivity() {
             saveSettings()
         }
 
-        // 重启图标：强制停止目标录屏应用，使修改后的码率生效
+        // 重启图标：强制停止目标应用（录屏 + 截屏），使新配置在下次启动时生效
         findViewById<ImageView>(
             R.id.iv_reset
         ).setOnClickListener {
-            forceStopRecorder()
+            restartTargets()
         }
     }
 
@@ -113,6 +115,7 @@ class MainActivity : AppCompatActivity() {
         hdrModeSpinner.setSelection(
             indexOfValue(hdrModeValues, prefs.getInt("hdr_mode", 0))
         )
+        screenshotPngCheck.isChecked = prefs.getBoolean("screenshot_png", true)
     }
 
     /** 校验并保存 UI 中的配置到 RemoteSettings。 */
@@ -143,6 +146,7 @@ class MainActivity : AppCompatActivity() {
             .putInt("color_standard", standard)
             .putInt("color_range", range)
             .putInt("hdr_mode", hdr)
+            .putBoolean("screenshot_png", screenshotPngCheck.isChecked)
             .apply()
 
         Toast.makeText(this, "设置已保存", Toast.LENGTH_SHORT).show()
@@ -155,24 +159,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 强制停止 OPlus 录屏（com.oplus.screenrecorder）。
+     * 强制停止两个目标应用：
+     *  - com.oplus.screenrecorder（系统录屏）
+     *  - com.oplus.screenshot（系统截屏）
      *
-     * 目标应用的码率配置在进程启动时（HookModule.onPackageReady）一次性读取，
-     * 因此修改码率后必须杀掉其进程，下次启动才会重新加载新配置。
-     * 这里只做 force-stop，不负责重新拉起录屏 App。
+     * 两者的 Hook 配置都在进程启动时（HookModule.onPackageReady）一次性读取，
+     * 因此修改设置后必须杀掉其进程，下次启动才会重新加载新配置。
+     * 这里只做 force-stop，不负责重新拉起它们（系统会按需自行拉起）。
      *
      * 依赖设备 Root 权限（LSPosed 环境已具备），通过 su 执行 am force-stop。
      */
-    private fun forceStopRecorder() {
+    private fun restartTargets() {
         Thread {
+            val targets = listOf(
+                "com.oplus.screenrecorder",
+                "com.oplus.screenshot"
+            )
             var success = false
             var error: String? = null
             try {
+                val cmd = targets.joinToString("; ") { "am force-stop $it" }
                 val proc = Runtime.getRuntime().exec(
-                    arrayOf(
-                        "su", "-c",
-                        "am force-stop com.oplus.screenrecorder"
-                    )
+                    arrayOf("su", "-c", cmd)
                 )
                 proc.waitFor()
                 success = proc.exitValue() == 0
@@ -184,7 +192,7 @@ class MainActivity : AppCompatActivity() {
                 if (success) {
                     Toast.makeText(
                         this,
-                        "已强制停止录屏应用，设置将在下次录屏时生效",
+                        "已重启录屏与截屏应用，设置将在下次使用时生效",
                         Toast.LENGTH_SHORT
                     ).show()
                 } else {

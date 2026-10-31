@@ -1,9 +1,12 @@
 package com.kai.oplusrecorder
 
+import android.content.ContentResolver
+import android.graphics.Bitmap
 import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
+import android.net.Uri
 import android.util.Log
 import android.view.Display
 import io.github.libxposed.api.XposedModule
@@ -14,6 +17,10 @@ class HookModule : XposedModule() {
 
     companion object {
         private const val TAG = "OplusRecorderHook"
+
+        // 目标应用包名
+        private const val RECORDER_PKG = "com.oplus.screenrecorder"
+        private const val SCREENSHOT_PKG = "com.oplus.screenshot"
 
         // 原始屏幕分辨率（竖屏基准）
         private const val ORIG_W = 1080
@@ -66,6 +73,12 @@ class HookModule : XposedModule() {
     private var colorTransfer: Int = DEFAULT_COLOR_TRANSFER
     private var hdrMode: Int = HDR_MODE_OFF
 
+    // 截屏：是否强制无损 PNG（由模块 UI 配置）
+    private var screenshotPng: Boolean = true
+
+    // 每个 Hook 只打一次命中日志，避免刷屏
+    private val loggedHits = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
     private fun log(msg: String) {
         log(Log.INFO, TAG, msg)
     }
@@ -109,7 +122,13 @@ class HookModule : XposedModule() {
             "packageName = ${param.packageName}"
         )
 
-        if (param.packageName != "com.oplus.screenrecorder") {
+        // 系统截屏应用：走独立的「无损 PNG」分支，与录屏逻辑完全无关
+        if (param.packageName == SCREENSHOT_PKG) {
+            onScreenshotPackageReady(param)
+            return
+        }
+
+        if (param.packageName != RECORDER_PKG) {
             return
         }
 
@@ -597,6 +616,124 @@ class HookModule : XposedModule() {
         }
     }
 
+
+    // =============================================
+    // 截屏应用（com.oplus.screenshot）：强制无损 PNG
+    //
+    // 保存链路（com.oplus.screenshot 17.7.10 实测）：
+    //   TaskSaveScreen -> SaveExecutor
+    //     ├─ ContentValues{mime_type = fmt.getMimeType()}
+    //     ├─ ImageFileInfo{name = "%s_%s" + fmt.getSuffix()}
+    //     └─ bitmap.compress(fmt.getCompressFormat(), 100, out)
+    //
+    // 三个 getter 是唯一真相源：只改它们，文件名 / MIME / 编码格式三者自动一致，
+    // 不会出现「jpg 改名 png」的假无损。
+    // 已用 dexdump 反汇编 classes5.dex 确认这三个方法都是 invoke-virtual 调用，
+    // 没有被 R8 内联，所以 Hook 一定命中。
+    // =============================================
+    private fun onScreenshotPackageReady(param: PackageReadyParam) {
+        try {
+            val prefs = getRemotePreferences("settings")
+            screenshotPng = prefs.getBoolean("screenshot_png", true)
+        } catch (t: Throwable) {
+            log("Failed to read screenshot settings, using defaults", t)
+        }
+
+        log("========== SCREENSHOT PACKAGE READY ==========")
+        log("screenshotPng=$screenshotPng")
+
+        if (!screenshotPng) {
+            log("PNG 输出已关闭，保持系统默认 JPEG")
+            return
+        }
+
+        hookScreenshotImageFormat(param.classLoader)
+    }
+
+    private fun hookScreenshotImageFormat(classLoader: ClassLoader) {
+        val cls = try {
+            classLoader.loadClass("com.oplus.screenshot.save.info.ImageFileFormat")
+        } catch (t: Throwable) {
+            log("[!] 未找到 ImageFileFormat，截屏 Hook 跳过", t)
+            return
+        }
+
+        hookImageFormatGetter(cls, "getMimeType", "image/png")
+        hookImageFormatGetter(cls, "getSuffix", ".png")
+        hookImageFormatGetter(cls, "getCompressFormat", Bitmap.CompressFormat.PNG)
+
+        // 兜底：万一某个版本把 getCompressFormat 内联进调用方，这里直接改写编码参数
+        hookSaveExecutorCompressFormat(classLoader)
+    }
+
+    /**
+     * 只改写 JPEG 单例；PDF（mime=application/pdf）与 PNG 单例原样返回。
+     *
+     * 用 Enum.name() 判断而不是读 JPEG 静态字段：R8 可能重命名字段，
+     * 但枚举名的字符串一定保留。
+     *
+     * libxposed API 102 的 Chain 没有 setResult，Hooker 的返回值就是方法结果，
+     * 因此不调用 proceed() 即为「直接替换返回值」。
+     */
+    private fun hookImageFormatGetter(cls: Class<*>, methodName: String, replacement: Any) {
+        try {
+            val m = cls.getDeclaredMethod(methodName)
+            deoptimize(m)
+            hook(m).intercept { chain ->
+                val isJpeg = (chain.thisObject as? Enum<*>)?.name == "JPEG"
+                if (screenshotPng && isJpeg) {
+                    if (loggedHits.putIfAbsent(methodName, true) == null) {
+                        log("[ImageFileFormat.$methodName] JPEG -> $replacement")
+                    }
+                    replacement
+                } else {
+                    chain.proceed()
+                }
+            }
+            log("[+] ImageFileFormat.$methodName hooked")
+        } catch (t: Throwable) {
+            log("[!] hook ImageFileFormat.$methodName FAILED", t)
+        }
+    }
+
+    /**
+     * SaveExecutor 中唯一把 CompressFormat 交给 Bitmap.compress 的方法：
+     *   n(ContentResolver, Uri, Bitmap, CompressFormat): boolean
+     * 按参数签名定位，不依赖混淆后的方法名。
+     */
+    private fun hookSaveExecutorCompressFormat(classLoader: ClassLoader) {
+        try {
+            val cls = classLoader.loadClass("com.oplus.screenshot.save.executor.SaveExecutor")
+            val target = cls.declaredMethods.firstOrNull { m ->
+                val p = m.parameterTypes
+                p.size == 4 &&
+                        p[0] == ContentResolver::class.java &&
+                        p[1] == Uri::class.java &&
+                        p[2] == Bitmap::class.java &&
+                        p[3] == Bitmap.CompressFormat::class.java
+            }
+            if (target == null) {
+                log("[!] SaveExecutor 写入方法未找到（版本可能已变化）")
+                return
+            }
+            deoptimize(target)
+            hook(target).intercept { chain ->
+                if (screenshotPng) {
+                    val newArgs = chain.args.toTypedArray()
+                    newArgs[3] = Bitmap.CompressFormat.PNG
+                    if (loggedHits.putIfAbsent("SaveExecutor#compress", true) == null) {
+                        log("[SaveExecutor.${chain.executable.name}] compress format -> PNG")
+                    }
+                    chain.proceed(newArgs)
+                } else {
+                    chain.proceed()
+                }
+            }
+            log("[+] SaveExecutor compress-format hook installed")
+        } catch (t: Throwable) {
+            log("[!] hook SaveExecutor FAILED", t)
+        }
+    }
 
     private fun modifyIntFields(obj: Any?, tag: String) {
         if (obj == null) return
