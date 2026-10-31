@@ -41,7 +41,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="录制画质 · HDR 10-bit · 无损截图"
+                android:text="分辨率 · 码率 · HDR 10-bit · 无损截图"
                 android:textColor="#E6FFFFFF"
                 android:textSize="13sp"
                 app:layout_constraintEnd_toStartOf="@id/iv_reset"
@@ -80,20 +80,66 @@
                 android:textSize="14sp"
                 android:textStyle="bold" />
 
-            <TextView
-                android:layout_width="wrap_content"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="2772 × 1272"
-                android:textColor="@color/text_primary"
-                android:textSize="22sp"
-                android:textStyle="bold" />
+                android:layout_marginTop="10dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/resolutionWidth"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:background="@drawable/bg_input"
+                    android:gravity="center"
+                    android:hint="宽"
+                    android:inputType="number"
+                    android:maxLength="5"
+                    android:paddingStart="14dp"
+                    android:paddingTop="12dp"
+                    android:paddingEnd="14dp"
+                    android:paddingBottom="12dp"
+                    android:textColor="@color/text_primary"
+                    android:textColorHint="@color/text_secondary"
+                    android:textSize="16sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:text="×"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="16sp" />
+
+                <EditText
+                    android:id="@+id/resolutionHeight"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:background="@drawable/bg_input"
+                    android:gravity="center"
+                    android:hint="高"
+                    android:inputType="number"
+                    android:maxLength="5"
+                    android:paddingStart="14dp"
+                    android:paddingTop="12dp"
+                    android:paddingEnd="14dp"
+                    android:paddingBottom="12dp"
+                    android:textColor="@color/text_primary"
+                    android:textColorHint="@color/text_secondary"
+                    android:textSize="16sp" />
+
+            </LinearLayout>
 
             <TextView
-                android:layout_width="wrap_content"
+                android:id="@+id/resolutionHint"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:text="固定为屏幕物理像素，无需设置"
+                android:layout_marginTop="8dp"
+                android:text="默认取屏幕物理分辨率；宽高顺序可互换，不得超过物理分辨率，且需为偶数。"
                 android:textColor="@color/text_secondary"
                 android:textSize="13sp" />
 
@@ -333,7 +379,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
                 android:lineSpacingExtra="6dp"
-                android:text="1. 在 LSPosed 中启用本模块，作用域勾选「录屏」(com.oplus.screenrecorder) 与「截屏」(com.oplus.screenshot)。截屏属系统应用，需先在 LSPosed 设置里打开「显示系统应用」才能勾选。\n2. 按需调整录屏码率 / 色彩 / HDR，以及是否把截图保存为 PNG，然后点击底部「保存设置」。\n3. 点击右上角重启图标强制停止两个目标应用，新配置才会生效。\n4. 录屏：打开系统录屏，编码选 HEVC(H.265) 即可开始录制。\n5. 截图：音量下 + 电源，或下拉通知栏点「截屏」，存下来的图片即为 PNG。\n6. 核对：录屏用 MediaInfo 看 Main10 / 10-bit / HLG 或 PQ / BT.2020；截图看相册详情是否 PNG，或 adb 检查文件头是否为 89 50 4E 47。"
+                android:text="1. 在 LSPosed 中启用本模块，作用域勾选「录屏」(com.oplus.screenrecorder) 与「截屏」(com.oplus.screenshot)。截屏属系统应用，需先在 LSPosed 设置里打开「显示系统应用」才能勾选。\n2. 按需调整分辨率、码率、色彩标准、色彩范围与 HDR 模式，以及是否把截图保存为 PNG，然后点击底部「保存设置」。\n3. 点击右上角重启图标强制停止两个目标应用，新配置才会生效。\n4. 录屏：打开系统录屏，编码选 HEVC(H.265) 即可开始录制。\n5. 截图：音量下 + 电源，或下拉通知栏点「截屏」，存下来的图片即为 PNG。\n6. 核对：录屏用 MediaInfo 看 Main10 / 10-bit / HLG 或 PQ / BT.2020；截图看相册详情是否 PNG，或 adb 检查文件头是否为 89 50 4E 47。"
                 android:textColor="@color/text_primary"
                 android:textSize="13sp" />
 

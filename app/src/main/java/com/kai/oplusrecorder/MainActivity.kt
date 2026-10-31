@@ -7,6 +7,7 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.Spinner
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -27,11 +28,17 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var videoEdit: EditText
     private lateinit var audioEdit: EditText
+    private lateinit var resolutionWidthEdit: EditText
+    private lateinit var resolutionHeightEdit: EditText
+    private lateinit var resolutionHint: TextView
     private lateinit var colorEnabledCheck: CheckBox
     private lateinit var colorStandardSpinner: Spinner
     private lateinit var colorRangeSpinner: Spinner
     private lateinit var hdrModeSpinner: Spinner
     private lateinit var screenshotPngCheck: CheckBox
+
+    /** 面板原生物理分辨率（竖屏基准），作为默认值与输入上限。 */
+    private lateinit var nativeResolution: ScreenResolution.Size
 
     override fun onCreate(
         savedInstanceState: Bundle?
@@ -44,11 +51,21 @@ class MainActivity : AppCompatActivity() {
 
         videoEdit = findViewById(R.id.videoBitrate)
         audioEdit = findViewById(R.id.audioBitrate)
+        resolutionWidthEdit = findViewById(R.id.resolutionWidth)
+        resolutionHeightEdit = findViewById(R.id.resolutionHeight)
+        resolutionHint = findViewById(R.id.resolutionHint)
         colorEnabledCheck = findViewById(R.id.colorEnabled)
         colorStandardSpinner = findViewById(R.id.colorStandard)
         colorRangeSpinner = findViewById(R.id.colorRange)
         hdrModeSpinner = findViewById(R.id.hdrMode)
         screenshotPngCheck = findViewById(R.id.screenshotPng)
+
+        // 分辨率默认值跟随屏幕物理分辨率，上限也以它为准
+        nativeResolution = ScreenResolution.nativeSize(this)
+        resolutionHint.text = "默认 = 屏幕物理分辨率 " +
+                "${nativeResolution.shortSide} × ${nativeResolution.longSide}" +
+                "（竖屏）；宽高顺序可互换，均不得超过该值，且需为偶数。"
+        showResolution(nativeResolution)
 
         WindowCompat.getInsetsController(window, window.decorView).apply {
             // 状态栏图标变黑（深色）
@@ -99,6 +116,21 @@ class MainActivity : AppCompatActivity() {
     private fun loadSettings() {
         val prefs = RemoteSettings.prefs ?: return
 
+        // 旧版本没有分辨率配置项：首次打开界面时把检测到的屏幕物理分辨率写成默认值，
+        // 保证目标进程即使拿不到显示模式信息，也能用上正确的默认分辨率。
+        if (!prefs.contains("resolution_width") || !prefs.contains("resolution_height")) {
+            prefs.edit()
+                .putInt("resolution_width", nativeResolution.shortSide)
+                .putInt("resolution_height", nativeResolution.longSide)
+                .apply()
+        }
+
+        showResolution(
+            ScreenResolution.normalize(
+                prefs.getInt("resolution_width", nativeResolution.shortSide),
+                prefs.getInt("resolution_height", nativeResolution.longSide)
+            )
+        )
         videoEdit.setText(
             (prefs.getInt("video_bitrate", 30_000_000) / 1_000_000.0).toString()
         )
@@ -128,6 +160,19 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val resWidth = resolutionWidthEdit.text.toString().toIntOrNull()
+        val resHeight = resolutionHeightEdit.text.toString().toIntOrNull()
+        if (resWidth == null || resHeight == null) {
+            Toast.makeText(this, "请输入有效的分辨率数值", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val resError = ScreenResolution.validate(resWidth, resHeight, nativeResolution)
+        if (resError != null) {
+            Toast.makeText(this, resError, Toast.LENGTH_LONG).show()
+            return
+        }
+        val resolution = ScreenResolution.normalize(resWidth, resHeight)
+
         val editor = RemoteSettings.prefs?.edit()
         if (editor == null) {
             Toast.makeText(this, "配置服务未就绪，请稍后重试", Toast.LENGTH_SHORT).show()
@@ -140,7 +185,9 @@ class MainActivity : AppCompatActivity() {
         val range = colorRangeValues[colorRangeSpinner.selectedItemPosition]
         val hdr = hdrModeValues[hdrModeSpinner.selectedItemPosition]
 
-        editor.putInt("video_bitrate", videoBps)
+        editor.putInt("resolution_width", resolution.shortSide)
+            .putInt("resolution_height", resolution.longSide)
+            .putInt("video_bitrate", videoBps)
             .putInt("audio_bitrate", audioBps)
             .putBoolean("color_enabled", colorEnabledCheck.isChecked)
             .putInt("color_standard", standard)
@@ -149,7 +196,19 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("screenshot_png", screenshotPngCheck.isChecked)
             .apply()
 
-        Toast.makeText(this, "设置已保存", Toast.LENGTH_SHORT).show()
+        // 回填归一化后的值，避免横竖屏顺序误解
+        showResolution(resolution)
+        Toast.makeText(
+            this,
+            "设置已保存（分辨率 ${resolution.shortSide} × ${resolution.longSide}）",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    /** 把分辨率按竖屏基准（宽 = 短边）回填到输入框。 */
+    private fun showResolution(size: ScreenResolution.Size) {
+        resolutionWidthEdit.setText(size.shortSide.toString())
+        resolutionHeightEdit.setText(size.longSide.toString())
     }
 
     /** 根据值查找对应下拉框位置，找不到时回退到 0。 */

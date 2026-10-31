@@ -2,22 +2,24 @@
 
 一个基于 **LSPosed / Xposed** 的模块，同时增强 OPPO / OnePlus 的两个系统应用：
 
-- **系统录屏** `com.oplus.screenrecorder` —— 录制分辨率、码率、色彩、HDR 10-bit；
+- **系统录屏** `com.oplus.screenrecorder` —— 分辨率、码率、色彩、HDR 10-bit；
 - **系统截屏** `com.oplus.screenshot` —— 把默认的 JPEG 输出改为**无损 PNG**。
 
 Hook 的目标都是目标应用里**原生设置没有开放**的能力：
 
-| 子功能 | 目标应用 | 说明 |
-| --- | --- | --- |
-| 点对点分辨率 | 录屏 | 录制分辨率提升到屏幕物理分辨率 `1272 × 2772`（仅限一加15） |
-| 自定义码率 | 录屏 | 视频 / 音频码率自由配置（默认视频 30 Mbps、音频 288 kbps） |
-| 色彩优化 | 录屏 | BT.601 + Limited → **BT.709 + Full Range** |
-| HDR / 10-bit 录制 | 录屏 | 可开启 **HLG** 或 **HDR10(PQ)**，注入 BT.2020 与 10-bit HEVC profile，相册标记为 **ProXDR** |
-| **无损 PNG 截图** | 截屏 | 保存格式 JPEG(q=100) → **PNG**，文件名 / MIME / 编码三者一致 |
+- **点对点分辨率**：默认按屏幕物理分辨率录制（例如 `1272 × 2772`），也可在界面中改成更低的尺寸，避免系统录屏固定压缩到 1080P。
+- **自定义码率**：视频 / 音频码率自由配置（默认视频 30 Mbps、音频 288 kbps）。
+- **色彩优化**：将色彩空间从默认的 BT.601 + Limited 改为 **BT.709 + Full Range**，色彩更准确、层次更丰富。
+- **HDR / 10-bit 录制**：可开启 **HLG** 或 **HDR10(PQ)**，注入 BT.2020 广色域与带 HDR 语义的 10-bit HEVC profile，录出被系统相册标记为 **ProXDR** 的 HDR 视频。
+- **无损 PNG 截图**：系统截屏固定以 JPEG(q=100) 保存，开启后改为 PNG，文件名 / MIME / 编码三者一致。
 
 > 所有参数均可在模块自带的界面里配置，无需修改脚本或重新编译。
 
 ---
+
+## 界面预览
+
+![主界面](示例.jpg)
 
 ## 功能一览
 
@@ -25,7 +27,7 @@ Hook 的目标都是目标应用里**原生设置没有开放**的能力：
 
 | 功能 | 说明 | 默认值 | 是否可配置 |
 | --- | --- | --- | --- |
-| 分辨率 | 捕获与编码尺寸同步提升到屏幕物理分辨率 | `1272 × 2772`（固定） | 否（跟随设备屏幕） |
+| 分辨率 | 捕获与编码尺寸，默认等于屏幕物理分辨率 | 屏幕物理分辨率（自动检测） | 是（不得超过物理分辨率、需为偶数） |
 | 视频码率 | 单位 Mbps | 30 | 是 |
 | 音频码率 | 单位 kbps | 288 | 是 |
 | 色彩优化开关 | 关闭时完全保留 App 原始色彩参数 | 开启 | 是 |
@@ -71,7 +73,8 @@ Hook 的目标都是目标应用里**原生设置没有开放**的能力：
    - 「截屏」（`com.oplus.screenshot`，需先打开「显示系统应用」）
 
 3. **配置参数**
-   打开「录屏/截图增强」界面，设置录屏码率 / 色彩 / HDR，以及是否把截图保存为 PNG，点击 **保存设置**。
+   打开「录屏/截图增强」界面，按需调整分辨率、视频 / 音频码率与色彩选项，以及是否把截图保存为 PNG，然后点击 **保存设置**。
+   分辨率默认等于屏幕物理分辨率（自动检测），可手动改小；超过物理分辨率、非偶数或过小的数值会被拒绝保存。
 
 4. **重启目标应用使配置生效**
    点击右上角的 **重启图标（⟳）**。它会对两个目标应用执行 `am force-stop`。
@@ -94,14 +97,14 @@ Hook 的目标都是目标应用里**原生设置没有开放**的能力：
 
 模块在目标进程启动时（`onPackageReady`）安装一系列 Hook：
 
-- **分辨率 / 码率**：Hook `MediaFormat.setInteger`、`MediaFormat.createVideoFormat`，将 width / height / bitrate 改写为目标值。
-- **虚拟显示器捕获尺寸**：若只改编码器尺寸而不改 VirtualDisplay 捕获尺寸，视频右侧 / 下侧会出现纯黑区域。为此模块：
-  - Hook 应用层包装类 `i4.u`（App 自己的 `createVirtualDisplay` 封装）——**主修复入口**；
-  - 同时 Hook `MediaProjection.createVirtualDisplay`、`DisplayManager.createVirtualDisplay`、`VirtualDisplay.resize` 作为补充。
-- **色彩注入**：Hook `MediaCodec.configure`，在编码器 configure 前强制注入 `color-standard` / `color-range` / `color-transfer` / `color-matrix`；开启 HDR 时额外注入 10-bit profile。
+- **分辨率 / 码率**：Hook `MediaFormat.setInteger`、`MediaFormat.createVideoFormat`，将 width / height / bitrate 改写为目标值。系统录屏的分辨率选项只指定短边（480 / 720 / 1080p），长边由屏幕比例换算（如 `2772 × 1080 / 1272 ≈ 2354`），因此宽高必须按「短边档位 × 屏幕比例」成对识别后再改写；原尺寸优先取编码器 configure 时捕获的真实请求尺寸，目标尺寸取用户配置（未配置或非法时回退到面板物理分辨率）。
+- **虚拟显示器捕获尺寸**：这是画面出现黑边的关键。若只改编码器尺寸而不改 VirtualDisplay 捕获尺寸，视频右侧 / 下侧会出现纯黑区域。为此模块：
+  - Hook 应用层包装类（旧版为 `i4.u`，现改为按已知类名 + dex 扫描动态发现），在调用框架 API 前反射改写配置对象内的宽高字段——这是**主修复入口**；
+  - 同时 Hook `MediaProjection.createVirtualDisplay`、`DisplayManager.createVirtualDisplay`（含 `VirtualDisplayConfig` 对象重载）、`VirtualDisplay.resize` 作为补充。
+- **色彩注入**：Hook `MediaCodec.configure`，在编码器 configure 前对视频编码器强制注入 `color-standard` / `color-range` / `color-transfer` / `color-matrix`；开启 HDR 时额外注入 10-bit profile 与 `hdr-static-info`。
 
 > **为什么优先 Hook 应用层类而非框架方法？**
-> 由 boot class loader 加载的框架方法经 PGO / AOT 优化后可能被内联或走 fast path，导致 Java 层 Hook 不触发；而应用自身代码（`i4.u`）始终可被 Xposed 拦截。
+> 由 boot class loader 加载的框架方法（如 `MediaProjection.createVirtualDisplay`）经 PGO / AOT 优化后可能被内联或走 fast path，导致 Java 层 Hook 不触发；而应用自身代码始终可被 Xposed 拦截，因此更可靠。
 
 ### 截图管线（无损 PNG）
 
@@ -139,7 +142,8 @@ TaskSaveScreen → SaveExecutor
 
 - **传输特性**：HLG（`color-transfer=7`）或 PQ（`color-transfer=6`）；
 - **原色 / 矩阵**：强制 BT.2020（`color-standard=6` / `color-matrix=6`）；
-- **10-bit profile**：先 `getCapabilitiesForType(mime)` 查询能力，再注入带 HDR 语义的 HEVC 档位——HLG 用 `Main10HLG10 (0x2000)`，PQ 用 `Main10HDR10 (0x1000)`。
+- **10-bit profile**：先 `getCapabilitiesForType(mime)` 查询编码器能力，再注入带 HDR 语义的 HEVC 档位——HLG 用 `Main10HLG10 (0x2000)`，PQ 用 `Main10HDR10 (0x1000)`；
+- **HDR 元数据**：构造 25 字节 `hdr-static-info`（max/min luminance、MaxCLL、MaxFALL），写入 `MediaFormat`。
 
 > **关键：为什么不能只用 `Main10`？**
 > `Main10 (0x2)` 只代表「10-bit」，本身仍是 SDR 档位。一旦显式指定 profile，编码器会优先用 profile 推导 VUI，把传输特性写回 **bt709**。必须用带 HDR 语义的 `Main10HLG10 / Main10HDR10`。
@@ -154,7 +158,8 @@ TaskSaveScreen → SaveExecutor
 app/src/main/
 ├── java/com/kai/oplusrecorder/
 │   ├── HookModule.kt      # Xposed 模块入口：录屏 Hook + 截屏 PNG Hook
-│   ├── MainActivity.kt    # 配置界面（码率 / 色彩 / HDR / 截图 PNG / 保存 / 重启）
+│   ├── MainActivity.kt    # 配置界面（分辨率 / 码率 / 色彩 / 截图 PNG / 保存 / 重启）
+│   ├── ScreenResolution.kt# 屏幕物理分辨率探测与输入校验
 │   └── App.kt             # Application，RemoteSettings 远程配置桥接
 ├── res/layout/
 │   └── activity_main.xml  # 界面布局
@@ -177,11 +182,12 @@ app/src/main/
 
 ### 录屏
 
-- **视频右侧 / 下侧有黑边**：说明 VirtualDisplay 捕获尺寸未被改写。请确认作用域已勾选系统录屏，并检查 logcat 中 `i4.u` 相关 Hook 是否命中。
-- **改了码率但没生效**：修改后必须点击重启图标 force-stop 目标应用。
-- **界面重新打开又变回默认值**：配置通过 `XposedService` 异步绑定读取，界面已用 `runWhenReady` 在绑定完成后回填。
-- **Full Range 画面偏暗 / 发灰**：部分播放器对 Full Range 兼容性不佳，可切回 Limited 对比。
-- **开启 HDR 后传输特性还是 bt709 / 位深仍 8-bit**：多为录屏应用未选 HEVC，或编码器未暴露 `Main10HLG10 (8192)` 档位。抓 logcat（tag `OplusRecorderHook`）看 `[CAPS] ... profiles=[...]`。
+- **视频右侧 / 下侧有黑边**：说明 VirtualDisplay 捕获尺寸未被改写，仅编码器尺寸生效。请确认作用域已勾选系统录屏，并检查 logcat 中应用层包装类相关 Hook 是否命中。
+- **改了码率但没生效**：修改后必须点击重启图标 force-stop 目标应用，下次录屏才会加载新配置。
+- **界面重新打开又变回默认值**：配置通过 `XposedService` 异步绑定读取，界面已用 `runWhenReady` 在绑定完成后回填；若仍异常，请确认 LSPosed 服务正常。
+- **分辨率无法改成更高**：输入上限为面板原生物理分辨率，超过会被拒绝；若检测到的上限偏低，请确认系统「屏幕分辨率」设置中是否提供了更高档位。
+- **Full Range 画面偏暗 / 发灰**：部分播放器对 Full Range 兼容性不佳，可在界面里把色彩范围切回 Limited 对比。
+- **开启 HDR 后传输特性还是 bt709 / 位深仍 8-bit**：多为录屏应用未选 HEVC，或编码器未暴露 `Main10HLG10 (8192)` 档位导致回退。抓 logcat（tag `OplusRecorderHook`）看 `[CAPS] ... profiles=[...]`。
 
 ### 截图
 
